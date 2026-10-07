@@ -3,19 +3,15 @@ services:
     name: donnar-line-backend-api
     runtime: node
     region: singapore
-    plan: starter
+    plan: free
     buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /health/ready
-    disk:
-      name: donnar-line-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
-      - key: DATABASE_PATH
-        value: /var/data/donnar.sqlite
+      - key: DATABASE_URL
+        sync: false
       - key: LINE_FAKE_MODE
         value: "false"
       - key: STAFF_USERNAME

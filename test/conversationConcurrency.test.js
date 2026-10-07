@@ -1,7 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createDatabase } = require('../database');
 const { createConversationService } = require('../service/conversationService');
+const { createTestDatabase } = require('./helpers/database');
+const { FakeLineMessagingClient } = require('../service/lineMessagingClient');
 
 function deferred() {
   let resolve;
@@ -10,14 +11,15 @@ function deferred() {
 }
 
 test('concurrent redelivery sends a customer reply once', async () => {
-  const db = createDatabase(':memory:');
+  const { pool: db, close } = await createTestDatabase();
   const calls = [];
   const entered = deferred();
   const finish = deferred();
-  const lineClient = {
+  const lineClient = new FakeLineMessagingClient();
+  Object.assign(lineClient, {
     reply: async (token, messages) => { calls.push({ token, messages }); entered.resolve(); await finish.promise; },
     push: async () => {},
-  };
+  });
   const service = createConversationService({ db, lineClient });
   const event = { type: 'follow', replyToken: 'reply-once', source: { type: 'user', userId: 'U-concurrent' }, webhookEventId: 'evt-concurrent' };
 
@@ -29,18 +31,19 @@ test('concurrent redelivery sends a customer reply once', async () => {
   await Promise.all([first, second]);
 
   assert.equal(calls.length, 1);
-  assert.equal(db.prepare("SELECT send_status FROM messages WHERE direction = 'OUT'").get().send_status, 'SENT');
-  db.close();
+  assert.equal((await db.query("SELECT send_status FROM messages WHERE direction = 'OUT'")).rows[0].send_status, 'SENT');
+  await close();
 });
 
 test('staff handoff cannot commit while an in-flight bot reply may still be sent', async () => {
-  const db = createDatabase(':memory:');
+  const { pool: db, close } = await createTestDatabase();
   const entered = deferred();
   const finish = deferred();
-  const lineClient = {
+  const lineClient = new FakeLineMessagingClient();
+  Object.assign(lineClient, {
     reply: async () => { entered.resolve(); await finish.promise; },
     push: async () => {},
-  };
+  });
   const service = createConversationService({ db, lineClient });
   const event = { type: 'follow', replyToken: 'reply-race', source: { type: 'user', userId: 'U-race' }, webhookEventId: 'evt-race' };
   const botTask = service.processEvent(event);
@@ -52,6 +55,6 @@ test('staff handoff cannot commit while an in-flight bot reply may still be sent
   assert.equal(handoffCommitted, false);
   finish.resolve();
   await Promise.all([botTask, handoffTask]);
-  assert.equal(db.prepare('SELECT mode FROM conversations WHERE id = 1').get().mode, 'HUMAN');
-  db.close();
+  assert.equal((await db.query('SELECT mode FROM conversations WHERE id = 1')).rows[0].mode, 'HUMAN');
+  await close();
 });

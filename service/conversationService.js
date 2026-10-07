@@ -1,5 +1,6 @@
 const { createHash } = require('node:crypto');
-const { getCopy, ensureSeeded } = require('./messageCatalog');
+const { getCopy } = require('./messageCatalog');
+const { withTransaction } = require('../database');
 
 const QUESTIONS = ['serviceType', 'projectSummary', 'budgetRange', 'contactPreference'];
 const SKIP = new Set(['ข้าม', 'ข้ามก่อน', 'skip']);
@@ -13,7 +14,6 @@ function eventId(event) {
 }
 
 function createConversationService({ db, lineClient }) {
-  ensureSeeded(db);
   const conversationLocks = new Map();
 
   async function withConversationLock(conversationId, operation) {
@@ -30,51 +30,52 @@ function createConversationService({ db, lineClient }) {
   }
 
   async function deliverPending(id, userId) {
-    const row = db.prepare("SELECT conversation_id FROM messages WHERE event_id = ? AND direction = 'OUT'").get(id);
-    if (!row) return;
-    await withConversationLock(row.conversation_id, async () => {
-      const pending = db.prepare("SELECT m.id, m.body, m.reply_token, m.allow_human_mode, c.mode FROM messages m JOIN conversations c ON c.id = m.conversation_id WHERE m.event_id = ? AND m.direction = 'OUT' AND m.send_status = 'PENDING'").get(id);
+    const { rows: found } = await db.query("SELECT conversation_id FROM messages WHERE event_id = $1 AND direction = 'OUT'", [id]);
+    if (!found[0]) return;
+    const conversationId = found[0].conversation_id;
+    await withConversationLock(conversationId, async () => {
+      const { rows } = await db.query("SELECT m.id, m.body, m.reply_token, m.allow_human_mode, c.mode FROM messages m JOIN conversations c ON c.id = m.conversation_id WHERE m.event_id = $1 AND m.direction = 'OUT' AND m.send_status = 'PENDING'", [id]);
+      const pending = rows[0];
       if (!pending) return;
       if (pending.mode === 'HUMAN' && !pending.allow_human_mode) {
-        db.prepare("UPDATE messages SET send_status = 'CANCELLED' WHERE id = ? AND send_status = 'PENDING'").run(pending.id);
+        await db.query("UPDATE messages SET send_status = 'CANCELLED' WHERE id = $1 AND send_status = 'PENDING'", [pending.id]);
         return;
       }
-      const claim = db.prepare("UPDATE messages SET send_status = 'SENDING', attempts = attempts + 1, last_error = NULL WHERE id = ? AND send_status = 'PENDING'").run(pending.id);
-      if (!claim.changes) return;
+      const claim = await db.query("UPDATE messages SET send_status = 'SENDING', attempts = attempts + 1, last_error = NULL WHERE id = $1 AND send_status = 'PENDING' RETURNING id", [pending.id]);
+      if (!claim.rowCount) return;
       try {
         const message = JSON.parse(pending.body);
         if (pending.reply_token) await lineClient.reply(pending.reply_token, [message]);
         else await lineClient.push(userId, [message]);
-        db.prepare("UPDATE messages SET send_status = 'SENT', reply_token = NULL WHERE id = ? AND send_status = 'SENDING'").run(pending.id);
+        await db.query("UPDATE messages SET send_status = 'SENT', reply_token = NULL WHERE id = $1 AND send_status = 'SENDING'", [pending.id]);
       } catch (error) {
         const status = error.retryable ? 'PENDING' : 'UNKNOWN';
         const category = error.retryable ? 'line_rate_limited' : (Number.isInteger(error.status) ? `line_http_${error.status}` : 'delivery_outcome_unknown');
-        db.prepare('UPDATE messages SET send_status = ?, last_error = ? WHERE id = ? AND send_status = \'SENDING\'').run(status, category, pending.id);
+        await db.query('UPDATE messages SET send_status = $1, last_error = $2 WHERE id = $3 AND send_status = \'SENDING\'', [status, category, pending.id]);
         throw error;
       }
     });
   }
 
-  function processEventState(event, id) {
-    if (!event || typeof event.type !== 'string') return { ignored: true };
-    if (!['follow', 'message', 'postback', 'unfollow'].includes(event.type)) return { ignored: true };
-
+  async function processEventState(client, event, id) {
+    if (!event || typeof event.type !== 'string' || !['follow', 'message', 'postback', 'unfollow'].includes(event.type)) return { ignored: true };
     const userId = event.source?.userId;
     if (!userId) return { ignored: true };
-    db.prepare('INSERT OR IGNORE INTO line_users(line_user_id) VALUES (?)').run(userId);
-    db.prepare('INSERT OR IGNORE INTO conversations(line_user_id) VALUES (?)').run(userId);
-    const conversation = db.prepare('SELECT * FROM conversations WHERE line_user_id = ?').get(userId);
-    db.prepare('INSERT OR IGNORE INTO leads(conversation_id, source) VALUES (?, NULL)').run(conversation.id);
+    await client.query('INSERT INTO line_users(line_user_id) VALUES ($1) ON CONFLICT (line_user_id) DO NOTHING', [userId]);
+    await client.query('INSERT INTO conversations(line_user_id) VALUES ($1) ON CONFLICT (line_user_id) DO NOTHING', [userId]);
+    const { rows: conversations } = await client.query('SELECT * FROM conversations WHERE line_user_id = $1', [userId]);
+    const conversation = conversations[0];
+    await client.query('INSERT INTO leads(conversation_id, source) VALUES ($1, NULL) ON CONFLICT (conversation_id) DO NOTHING', [conversation.id]);
 
-    function queueReply(text, allowHumanMode = false) {
+    async function queueReply(text, allowHumanMode = false) {
       if (!text) return;
       const message = { type: 'text', text };
-      db.prepare("INSERT OR IGNORE INTO messages(conversation_id, direction, message_type, body, event_id, reply_token, send_status, allow_human_mode) VALUES (?, 'OUT', 'text', ?, ?, ?, 'PENDING', ?)")
-        .run(conversation.id, JSON.stringify(message), id, event.replyToken || null, allowHumanMode ? 1 : 0);
+      await client.query(`INSERT INTO messages(conversation_id, direction, message_type, body, event_id, reply_token, send_status, allow_human_mode)
+        VALUES ($1, 'OUT', 'text', $2, $3, $4, 'PENDING', $5) ON CONFLICT (event_id, direction) DO NOTHING`, [conversation.id, JSON.stringify(message), id, event.replyToken || null, allowHumanMode]);
     }
 
     if (event.type === 'follow') {
-      queueReply(getCopy(db, 'greeting'));
+      await queueReply(await getCopy(client, 'greeting'));
       return { processed: true };
     }
     if (event.type === 'unfollow') return { processed: true };
@@ -83,36 +84,33 @@ function createConversationService({ db, lineClient }) {
     if (event.type === 'message') {
       const message = event.message || {};
       incomingText = message.type === 'text' ? message.text : `[${message.type || 'unknown'} message]`;
-      db.prepare("INSERT OR IGNORE INTO messages(conversation_id, direction, message_type, body, event_id) VALUES (?, 'IN', ?, ?, ?)")
-        .run(conversation.id, message.type || 'unknown', incomingText, id);
+      await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id) VALUES ($1, 'IN', $2, $3, $4) ON CONFLICT (event_id, direction) DO NOTHING", [conversation.id, message.type || 'unknown', incomingText, id]);
     } else {
-      db.prepare("INSERT OR IGNORE INTO messages(conversation_id, direction, message_type, body, event_id) VALUES (?, 'IN', 'postback', ?, ?)")
-        .run(conversation.id, JSON.stringify(event.postback || {}), id);
+      await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id) VALUES ($1, 'IN', 'postback', $2, $3) ON CONFLICT (event_id, direction) DO NOTHING", [conversation.id, JSON.stringify(event.postback || {}), id]);
     }
 
     const postback = event.type === 'postback' ? String(event.postback?.data || '') : '';
     const asksForHuman = isHandoffText(incomingText) || ['action=HUMAN', 'action=CONTACT_TEAM', 'handoff=human'].includes(postback);
     if (asksForHuman) {
       if (conversation.mode === 'BOT') {
-        db.prepare("UPDATE conversations SET mode = 'HUMAN', handoff_reason = 'customer_request', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(conversation.id);
-        db.prepare("UPDATE leads SET status = 'HUMAN_REQUIRED', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?").run(conversation.id);
-        queueReply(getCopy(db, 'handoff'), true);
+        await client.query("UPDATE conversations SET mode = 'HUMAN', handoff_reason = 'customer_request', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
+        await client.query("UPDATE leads SET status = 'HUMAN_REQUIRED', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1", [conversation.id]);
+        await queueReply(await getCopy(client, 'handoff'), true);
       }
       return { processed: true, mode: 'HUMAN' };
     }
-
     if (conversation.mode === 'HUMAN') return { processed: true, mode: 'HUMAN' };
 
     if (event.type === 'postback') {
       const action = new URLSearchParams(postback).get('action');
       if (action === 'START_QUALIFY') {
-        db.prepare("UPDATE conversations SET current_step = 'serviceType', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(conversation.id);
-        db.prepare("UPDATE leads SET requirements_json = '{}', status = 'QUALIFYING', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?").run(conversation.id);
-        queueReply(getCopy(db, 'serviceType'));
-      } else if (action === 'SERVICES') queueReply(getCopy(db, 'services'));
-      else if (action === 'WORKFLOW') queueReply(getCopy(db, 'workflow'));
-      else if (action === 'PORTFOLIO') queueReply(getCopy(db, 'portfolio'));
-      else if (action === 'QUOTE') queueReply(getCopy(db, 'serviceType'));
+        await client.query("UPDATE conversations SET current_step = 'serviceType', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
+        await client.query("UPDATE leads SET requirements_json = '{}'::jsonb, status = 'QUALIFYING', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1", [conversation.id]);
+        await queueReply(await getCopy(client, 'serviceType'));
+      } else if (action === 'SERVICES') await queueReply(await getCopy(client, 'services'));
+      else if (action === 'WORKFLOW') await queueReply(await getCopy(client, 'workflow'));
+      else if (action === 'PORTFOLIO') await queueReply(await getCopy(client, 'portfolio'));
+      else if (action === 'QUOTE') await queueReply(await getCopy(client, 'serviceType'));
       return { processed: true };
     }
 
@@ -120,59 +118,53 @@ function createConversationService({ db, lineClient }) {
     const text = incomingText.trim();
     if (!text) return { processed: true };
     if (conversation.current_step === 'serviceType' && /^services$/i.test(text)) {
-      queueReply(getCopy(db, 'services'));
+      await queueReply(await getCopy(client, 'services'));
       return { processed: true };
     }
     if (conversation.current_step === 'complete') {
-      queueReply(getCopy(db, 'fallback'));
+      await queueReply(await getCopy(client, 'fallback'));
       return { processed: true };
     }
 
-    const lead = db.prepare('SELECT requirements_json FROM leads WHERE conversation_id = ?').get(conversation.id);
-    const requirements = JSON.parse(lead.requirements_json);
+    const { rows: leads } = await client.query('SELECT requirements_json FROM leads WHERE conversation_id = $1', [conversation.id]);
+    const requirements = leads[0]?.requirements_json || {};
     const step = QUESTIONS.includes(conversation.current_step) ? conversation.current_step : 'serviceType';
     if (!SKIP.has(text.toLowerCase())) requirements[step] = text;
     const nextIndex = QUESTIONS.indexOf(step) + 1;
     const nextStep = QUESTIONS[nextIndex] || 'complete';
-    db.prepare('UPDATE leads SET requirements_json = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?')
-      .run(JSON.stringify(requirements), nextStep === 'complete' ? 'QUALIFIED' : 'QUALIFYING', conversation.id);
-    db.prepare('UPDATE conversations SET current_step = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(nextStep, conversation.id);
-    queueReply(nextStep === 'complete'
+    await client.query('UPDATE leads SET requirements_json = $1::jsonb, status = $2, updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $3', [JSON.stringify(requirements), nextStep === 'complete' ? 'QUALIFIED' : 'QUALIFYING', conversation.id]);
+    await client.query('UPDATE conversations SET current_step = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [nextStep, conversation.id]);
+    await queueReply(nextStep === 'complete'
       ? 'ขอบคุณที่เล่ารายละเอียดครับ ทีม Donnar.Tech จะตรวจสอบโจทย์และมาตอบในแชตนี้ หากต้องการคุยกับทีมทันที พิมพ์ “คุยกับคน” ได้เลยครับ'
-      : getCopy(db, nextStep));
+      : await getCopy(client, nextStep));
     return { processed: true };
   }
 
   async function processEvent(event) {
     const id = eventId(event);
-    let duplicate = false;
     let result;
-    const handle = db.transaction(() => {
-      const inserted = db.prepare('INSERT OR IGNORE INTO webhook_events(event_id, event_type) VALUES (?, ?)').run(id, event?.type || 'unknown');
-      if (inserted.changes === 0) {
-        duplicate = true;
-        return;
-      }
-      result = processEventState(event, id);
+    const inserted = await withTransaction(db, async (client) => {
+      const dedupe = await client.query('INSERT INTO webhook_events(event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING RETURNING event_id', [id, event?.type || 'unknown']);
+      if (!dedupe.rowCount) return false;
+      result = await processEventState(client, event, id);
+      return true;
     });
-    handle.immediate();
     const userId = event?.source?.userId;
-    if (userId) await deliverPending(id, userId);
-    return duplicate ? { duplicate: true } : result;
+    if (inserted && userId) await deliverPending(id, userId);
+    return inserted ? result : { duplicate: true };
   }
 
   async function setMode(conversationId, mode, staffUsername) {
     if (!['BOT', 'HUMAN'].includes(mode)) throw new Error('Invalid conversation mode');
-    return withConversationLock(conversationId, async () => {
-      const update = db.prepare('UPDATE conversations SET mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(mode, conversationId);
-      if (!update.changes) return false;
-      if (mode === 'HUMAN') db.prepare("UPDATE leads SET status = 'HUMAN_REQUIRED', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = (SELECT id FROM conversations WHERE id = ?)").run(conversationId);
-      else db.prepare("UPDATE leads SET status = 'QUALIFYING', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ? AND status = 'HUMAN_REQUIRED'").run(conversationId);
-      if (mode === 'HUMAN') db.prepare("UPDATE messages SET send_status = 'CANCELLED' WHERE conversation_id = ? AND direction = 'OUT' AND send_status = 'PENDING' AND allow_human_mode = 0").run(conversationId);
-      db.prepare('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES (?, ?, ?, ?, ?)')
-        .run(staffUsername, 'conversation.mode_changed', 'conversation', String(conversationId), JSON.stringify({ mode }));
+    return withConversationLock(conversationId, () => withTransaction(db, async (client) => {
+      const update = await client.query('UPDATE conversations SET mode = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING id', [mode, conversationId]);
+      if (!update.rowCount) return false;
+      if (mode === 'HUMAN') await client.query("UPDATE leads SET status = 'HUMAN_REQUIRED', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1", [conversationId]);
+      else await client.query("UPDATE leads SET status = 'QUALIFYING', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1 AND status = 'HUMAN_REQUIRED'", [conversationId]);
+      if (mode === 'HUMAN') await client.query("UPDATE messages SET send_status = 'CANCELLED' WHERE conversation_id = $1 AND direction = 'OUT' AND send_status = 'PENDING' AND allow_human_mode = FALSE", [conversationId]);
+      await client.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [staffUsername, 'conversation.mode_changed', 'conversation', String(conversationId), JSON.stringify({ mode })]);
       return true;
-    });
+    }));
   }
 
   return { processEvent, setMode };

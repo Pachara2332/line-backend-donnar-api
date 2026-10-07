@@ -12,7 +12,8 @@
     "dev": "node --watch server.js",
     "test": "node --test",
     "db:migrate": "node database/migrate.js",
-    "db:seed": "node database/seed.js"
+    "db:seed": "node database/seed.js",
+    "db:import-sqlite": "node scripts/import-sqlite-to-postgres.js"
   },
   "dependencies": {
     "dotenv": "^16.5.0",

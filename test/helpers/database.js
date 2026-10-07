@@ -1,11 +1,11 @@
 const { newDb } = require('pg-mem');
-const { migrateDatabase } = require('../../database');
+const { initializeDatabase } = require('../../database');
 
-async function createTestDatabase({ migrate = true } = {}) {
+async function createTestDatabase({ migrate = true, config = {} } = {}) {
   const memory = newDb({ autoCreateForeignKeyIndices: true, noAstCoverageCheck: true });
   const { Pool } = memory.adapters.createPg();
   const pool = new Pool();
-  if (migrate) await migrateDatabase(pool);
+  if (migrate) await initializeDatabase(pool, config);
   return { pool, close: () => pool.end() };
 }
 

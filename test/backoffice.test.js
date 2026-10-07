@@ -3,28 +3,42 @@ const assert = require('node:assert/strict');
 const request = require('supertest');
 const { randomBytes, scryptSync } = require('node:crypto');
 const { buildApp } = require('../app');
-const { createDatabase } = require('../database');
+const { withTransaction } = require('../database');
 const { getCopy } = require('../service/messageCatalog');
+const { createTestDatabase } = require('./helpers/database');
+const { FakeLineMessagingClient } = require('../service/lineMessagingClient');
 
 function passwordHash(password) {
   const salt = randomBytes(16).toString('hex');
   return `scrypt$${salt}$${scryptSync(password, salt, 64).toString('hex')}`;
 }
 
-test('requires a staff session and CSRF token for back-office changes', async () => {
-  const db = createDatabase(':memory:');
-  const hash = passwordHash('correct horse battery staple');
-  db.prepare('INSERT INTO staff_users(username, password_hash) VALUES (?, ?)').run('operator', hash);
-  db.prepare("INSERT INTO line_users(line_user_id) VALUES ('U5')").run();
-  db.prepare("INSERT INTO conversations(line_user_id) VALUES ('U5')").run();
-  const app = buildApp({ db, lineClient: { reply: async () => {}, push: async () => {} }, config: { lineChannelSecret: 'secret', lineAccessToken: '', publicBaseUrl: 'http://localhost' } });
+async function setup({ hash = passwordHash('correct horse battery staple') } = {}) {
+  const { pool: db, close } = await createTestDatabase();
+  await withTransaction(db, async (client) => {
+    await client.query('INSERT INTO staff_users(username, password_hash) VALUES ($1, $2)', ['operator', hash]);
+  });
+  const lineClient = new FakeLineMessagingClient();
+  const config = { lineChannelSecret: 'secret', lineAccessToken: '', fakeLineMode: true, publicBaseUrl: 'http://localhost' };
+  const app = buildApp({ db, lineClient, config });
+  return { db, app, close };
+}
+
+async function login(app) {
+  const response = await request(app).post('/admin/login').type('form').send({ username: 'operator', password: 'correct horse battery staple' });
+  const cookie = response.headers['set-cookie'][0].split(';')[0];
+  const page = await request(app).get('/admin').set('cookie', cookie);
+  return { cookie, page, csrf: page.text.match(/name="_csrf" value="([^"]+)"/)[1] };
+}
+
+test('requires a staff session and CSRF token for back-office changes', async (t) => {
+  const { db, app, close } = await setup();
+  t.after(close);
+  await db.query("INSERT INTO line_users(line_user_id) VALUES ('U5')");
+  await db.query("INSERT INTO conversations(line_user_id) VALUES ('U5')");
 
   assert.equal((await request(app).get('/admin')).status, 303);
-  const login = await request(app).post('/admin/login').type('form').send({ username: 'operator', password: 'correct horse battery staple' });
-  assert.equal(login.status, 303);
-  const cookie = login.headers['set-cookie'][0].split(';')[0];
-  const page = await request(app).get('/admin').set('cookie', cookie);
-  const csrf = page.text.match(/name="_csrf" value="([^"]+)"/)[1];
+  const { cookie, page, csrf } = await login(app);
   assert.equal(page.status, 200);
   assert.match(page.text, /Donnar\.Tech · LINE Back Office/);
 
@@ -32,47 +46,47 @@ test('requires a staff session and CSRF token for back-office changes', async ()
   assert.equal(rejected.status, 403);
   const accepted = await request(app).post('/admin/conversations/1/mode').set('cookie', cookie).type('form').send({ mode: 'HUMAN', _csrf: csrf });
   assert.equal(accepted.status, 303);
-  assert.equal(db.prepare('SELECT mode FROM conversations WHERE id = 1').get().mode, 'HUMAN');
-  db.close();
+  assert.equal((await db.query('SELECT mode FROM conversations WHERE id = 1')).rows[0].mode, 'HUMAN');
 });
 
-test('publishes message copy revisions with an audit entry and escapes edited text in the console', async () => {
-  const db = createDatabase(':memory:');
-  db.prepare('INSERT INTO staff_users(username, password_hash) VALUES (?, ?)').run('operator', passwordHash('correct horse battery staple'));
-  const app = buildApp({ db, lineClient: { reply: async () => {}, push: async () => {} }, config: { lineChannelSecret: 'secret', lineAccessToken: '', publicBaseUrl: 'http://localhost' } });
-  const login = await request(app).post('/admin/login').type('form').send({ username: 'operator', password: 'correct horse battery staple' });
-  const cookie = login.headers['set-cookie'][0].split(';')[0];
-  const page = await request(app).get('/admin').set('cookie', cookie);
-  const csrf = page.text.match(/name="_csrf" value="([^"]+)"/)[1];
+test('publishes message copy revisions with an audit entry and escapes edited text in the console', async (t) => {
+  const { db, app, close } = await setup();
+  t.after(close);
+  const { cookie, csrf } = await login(app);
   const body = 'ข้อความทดสอบ <script>alert(1)</script>';
   const draft = await request(app).post('/admin/content/draft').set('cookie', cookie).type('form').send({ _csrf: csrf, key: 'fallback', body });
   assert.equal(draft.status, 303);
-  const revision = db.prepare("SELECT id FROM message_revisions WHERE message_key = 'fallback' AND status = 'DRAFT' ORDER BY revision DESC LIMIT 1").get();
-  const republished = await request(app).post(`/admin/content/${revision.id}/publish`).set('cookie', cookie).type('form').send({ _csrf: csrf });
+  const { rows: revisions } = await db.query("SELECT id FROM message_revisions WHERE message_key = 'fallback' AND status = 'DRAFT' ORDER BY revision DESC LIMIT 1");
+  const republished = await request(app).post(`/admin/content/${revisions[0].id}/publish`).set('cookie', cookie).type('form').send({ _csrf: csrf });
 
   assert.equal(republished.status, 303);
-  assert.equal(getCopy(db, 'fallback'), body);
-  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'content.published'").get().count, 1);
+  assert.equal(await getCopy(db, 'fallback'), body);
+  assert.equal(Number((await db.query("SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'content.published'")).rows[0].count), 1);
   const updatedPage = await request(app).get('/admin').set('cookie', cookie);
   assert.doesNotMatch(updatedPage.text, /<script>alert\(1\)<\/script>/);
   assert.match(updatedPage.text, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
-  db.close();
 });
 
-test('records an uncertain staff reply and shows its delivery state in the console', async () => {
-  const db = createDatabase(':memory:');
-  db.prepare('INSERT INTO staff_users(username, password_hash) VALUES (?, ?)').run('operator', passwordHash('correct horse battery staple'));
-  db.prepare("INSERT INTO line_users(line_user_id) VALUES ('U-staff-reply')").run();
-  db.prepare("INSERT INTO conversations(line_user_id, mode) VALUES ('U-staff-reply', 'HUMAN')").run();
-  db.prepare("INSERT INTO leads(conversation_id) VALUES (1)").run();
-  const app = buildApp({ db, lineClient: { reply: async () => {}, push: async () => { throw new Error('timeout'); } }, config: { lineChannelSecret: 'secret', lineAccessToken: '', publicBaseUrl: 'http://localhost' } });
-  const login = await request(app).post('/admin/login').type('form').send({ username: 'operator', password: 'correct horse battery staple' });
-  const cookie = login.headers['set-cookie'][0].split(';')[0];
-  const page = await request(app).get('/admin').set('cookie', cookie);
-  const csrf = page.text.match(/name="_csrf" value="([^"]+)"/)[1];
-  assert.equal((await request(app).post('/admin/conversations/1/reply').set('cookie', cookie).type('form').send({ _csrf: csrf, text: 'สวัสดีครับ' })).status, 500);
-  assert.equal(db.prepare("SELECT send_status FROM messages WHERE direction = 'OUT'").get().send_status, 'UNKNOWN');
+test('records and displays the delivery state for staff replies', async (t) => {
+  const { db, app, close } = await setup();
+  t.after(close);
+  await db.query("INSERT INTO line_users(line_user_id) VALUES ('U-staff-reply')");
+  await db.query("INSERT INTO conversations(line_user_id, mode) VALUES ('U-staff-reply', 'HUMAN')");
+  await db.query('INSERT INTO leads(conversation_id) VALUES (1)');
+  const { cookie, csrf } = await login(app);
+  app.locals.lineClient.push = async () => { throw new Error('timeout'); };
+  const reply = await request(app).post('/admin/conversations/1/reply').set('cookie', cookie).type('form').send({ _csrf: csrf, text: 'สวัสดีครับ' });
+  assert.equal(reply.status, 500);
+  const { rows } = await db.query("SELECT send_status FROM messages WHERE direction = 'OUT'");
+  assert.equal(rows[0].send_status, 'UNKNOWN');
   const updated = await request(app).get('/admin').set('cookie', cookie);
   assert.match(updated.text, /UNKNOWN/);
-  db.close();
+});
+
+test('rejects expired staff sessions', async (t) => {
+  const { db, app, close } = await setup();
+  t.after(close);
+  const { cookie } = await login(app);
+  await db.query("UPDATE staff_sessions SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second'");
+  assert.equal((await request(app).get('/admin').set('cookie', cookie)).status, 303);
 });

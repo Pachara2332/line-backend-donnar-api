@@ -1,64 +1,69 @@
-# Deploy Donnar LINE backend on Render
+# Deploy Donnar LINE backend with Render Free and Supabase Free
 
-This repo is prepared for a single Render web service with a persistent disk. The backend currently uses SQLite and must stay at one instance; do not enable autoscaling or add replicas. Render's free web services do not support persistent disks, so this blueprint uses a paid Starter service. Confirm current charges in Render before creating resources.
+This repository is prepared for one Render Free Node service backed by Supabase PostgreSQL. No persistent Render disk or paid database add-on is required by the Blueprint. Free services sleep when idle and are not suitable where uninterrupted webhook response or managed backups are required.
 
-## 1. Push the repo to GitHub
+## 1. Create the Supabase database
 
-Render deploys from a Git repository. Push this repository to the GitHub remote connected to your Render account, including `render.yaml`. Do not commit `.env`, channel credentials, password hashes, database files, or real customer data. `.gitignore` excludes these local files.
+1. Create a Supabase project in a region close to the Render Singapore service.
+2. In **Project Settings → Database → Connection string**, choose the **Session pooler** connection string. This is suitable for a long-lived Node `pg` pool and Render's IPv4-only outbound networking.
+3. Copy the connection string privately. Keep the password safe; do not commit it, put it in this repository, or paste it into chat.
+4. The app uses TLS with certificate validation. If the provided URL does not request SSL, append `?sslmode=require` (or `&sslmode=require` when it already has query parameters).
+5. Supabase Free currently provides up to 500 MB of database storage. Free projects with low activity may pause after seven days and do not include downloadable database backups. Keep an independent, encrypted export and verify your restore procedure before storing business-critical conversations.
 
-## 2. Create the Render service
+## 2. Push the repository and create the Render service
 
-1. Sign in to Render and choose **New → Blueprint**.
-2. Connect `Pachara2332/line-backend-donnar-api` (or the private fork you intend to deploy).
-3. Select the `main` branch and apply the Blueprint.
-4. Render prompts for `LINE_CHANNEL_SECRET`, `LINE_CHANNEL_ACCESS_TOKEN`, and `STAFF_PASSWORD_HASH`. It is also safe to defer entering them until the service exists, but the app will not start in production until all three are set.
-5. After deployment, copy the service's HTTPS URL, for example `https://donnar-line-backend-api.onrender.com`.
+1. Push this branch to your GitHub repository's `main` branch after reviewing the changes.
+2. In Render choose **New → Blueprint**, select the repository and deploy the Blueprint from `main`.
+3. The Blueprint creates one Free web service, uses `/health/ready` for readiness, and asks for the out-of-band values `DATABASE_URL`, `LINE_CHANNEL_SECRET`, `LINE_CHANNEL_ACCESS_TOKEN`, and `STAFF_PASSWORD_HASH`.
+4. Put each value directly in Render's environment/secret UI. The app will not start in production until all four are present and valid. Never put them into `render.yaml`, Git, or chat.
+5. Leave the service at one instance. Render Free has an ephemeral filesystem; the app stores business data in Supabase only.
+6. Wait for deployment and confirm `https://<service-host>/health/ready` returns `{"status":"ready"}`. The first request after idle may be slow while the Free service wakes.
 
-The Blueprint attaches a 1 GB persistent disk at `/var/data` and stores SQLite at `/var/data/donnar.sqlite`. Keep one instance. The disk incurs a separate charge and redeploys have brief downtime. Review current plan and storage charges in Render before provisioning.
+## 3. Generate the staff password hash
 
-## 3. Prepare the staff password
-
-On a trusted local machine, run:
+Run this locally and enter a password of at least 12 characters:
 
 ```sh
-npm ci
 node scripts/hash-password.js
 ```
 
-The script prompts for a password and prints a scrypt hash. Put that hash into the Render `STAFF_PASSWORD_HASH` secret field. Do not put the plain password or hash in Git, this chat, or a ticket. Login at `https://<service-host>/admin/login` with username `admin` and the password you entered.
+Put the printed scrypt hash directly into Render as `STAFF_PASSWORD_HASH`. Do not share the hash or password. Staff login is at `https://<service-host>/admin/login`; default username is `admin` unless `STAFF_USERNAME` was overridden.
 
-## 4. Find LINE channel credentials
+## 4. Configure LINE Developers
 
-The OA already has Messaging API enabled according to the design spec. Sign in to [LINE Developers Console](https://developers.line.biz/console/) using an account with Admin access to the provider and Messaging API channel linked to the OA.
+1. In the Messaging API channel associated with the Donnar.Tech Official Account, set the webhook URL to `https://<service-host>/webhooks/line`.
+2. Verify the webhook. Check the Render health endpoint if the verification fails; do not weaken signature checks.
+3. Enable **Use webhook** only after verification. Keep the previous greeting and OA auto-replies in mind while testing, since they may overlap.
+4. Use a test account to verify follow greeting, duplicate delivery, text qualification, Rich Menu postbacks, BOT → HUMAN → BOT, staff replies, and invalid signature rejection.
+5. After validation, disable the overlapping greeting/auto-reply in LINE OA Manager so customers receive only one greeting.
 
-- **Channel secret:** open the Messaging API channel → **Basic settings** → copy **Channel secret**.
-- **Channel access token:** open the same channel → **Messaging API** tab → issue a channel access token. Use an access token supported by the channel and manage its renewal/rotation in LINE. LINE currently recommends a user-specified-expiration token (v2.1); long-lived tokens can be revoked and reissuing one invalidates the previous long-lived token.
-- Enter both values directly into Render's service **Environment** page as `LINE_CHANNEL_SECRET` and `LINE_CHANNEL_ACCESS_TOKEN`. Do not paste them into chat or commit them.
+## 5. Preview and publish Rich Menu
 
-The channel must be the one linked to the existing OA. LINE allows only one Messaging API channel per OA; do not create or link a second one during deployment.
+1. Sign in to `/admin/login` and inspect the leads/conversation console.
+2. Use **ดูตัวอย่าง** to review the menu image and actions.
+3. Use **สร้างและเผยแพร่ Rich Menu** to create the menu through LINE Messaging API and make it the default. Replacing an active menu requires a separate confirmation.
+4. Open a LINE chat with the OA, close/reopen the chat if needed, and confirm the menu displays. Verify all three actions.
 
-## 5. Set webhook and test
+## Local verification
 
-Only after the Render service is **Live** and `/health/ready` returns `{"status":"ready"}`:
+```sh
+npm ci
+npm test
+npm audit
+```
 
-1. In LINE Developers Console, open the linked Messaging API channel → **Messaging API** tab.
-2. Set **Webhook URL** to `https://<service-host>/webhooks/line`.
-3. Click **Verify** and expect success. Enable **Use webhook**.
-4. Keep the existing OA greeting and manual handling during initial tests. Do not disable the existing greeting until the backend greeting is confirmed and ready for the chosen cutover.
-5. Add the OA as a friend from a test account. Test follow greeting, qualification, each Rich Menu action, BOT → HUMAN → BOT, staff reply, and webhook redelivery.
-6. Log in to `/admin`, preview the Rich Menu, then use **สร้างและเผยแพร่ Rich Menu**. This makes real Messaging API calls and sets the new menu as the OA's default menu. The current Rich Menu is not uploaded until this deliberate action.
-7. Re-enter the chat to refresh the menu. If it still does not show, check LINE's Rich Menu display priority and remove/disable any per-user or OA Manager menu that takes precedence. LINE clients may not immediately reflect a changed default menu.
+Tests use an in-memory PostgreSQL-compatible database and fake LINE client; they do not call LINE or alter OA settings.
 
-When ready for customers, disable overlapping OA Manager greeting/auto-reply settings so customers do not receive duplicate greetings. Keep a rollback path: disable **Use webhook** and restore the prior OA greeting.
+## Rollback
 
-## 6. Verify operations
+If automated behavior is wrong, disable **Use webhook** in LINE Developers and restore the former OA greeting/auto-reply. Do not delete the Supabase project or Render secrets while investigating. Export the database before any reset. No real OA settings are changed automatically by this backend.
 
-- Render health check: `https://<service-host>/health/ready`
-- Staff console: `https://<service-host>/admin/login`
-- LINE webhook: `https://<service-host>/webhooks/line`
-- Set up an encrypted backup/export process for `/var/data/donnar.sqlite` and define customer-data retention before production use.
-- Never scale this SQLite service horizontally. Migrate to managed PostgreSQL before running multiple instances or requiring zero-downtime deploys.
+## Existing SQLite data
 
-## Current boundaries
+Deploy does not import local SQLite data. Back up the SQLite file first, initialize an empty Supabase schema, then run the explicit importer from a trusted local machine:
 
-This repo can create a menu in LINE and make it default from the back office. It does not log in to Render or LINE on your behalf, cannot issue your channel credentials, and does not change OA settings automatically. Those operations require your account sessions and explicit access. The local fake adapter is disabled in the Render production Blueprint.
+```sh
+DATABASE_URL='postgresql://…' node scripts/import-sqlite-to-postgres.js ./data/donnar.sqlite
+```
+
+The importer refuses a non-empty target and uses a single transaction. Review counts and test the console before enabling the LINE webhook.

@@ -66,7 +66,7 @@
 - [ ] **Step 4: Write failing migration tests** for fresh schema creation, a second idempotent run, seeding, and restart recovery.
 - [ ] **Step 5: Implement the version table and transactional migration runner.** Put tables and indexes in `001_initial.sql`; use identity IDs, `JSONB` for lead requirements/audit details, `BOOLEAN` for flags, and `TIMESTAMPTZ` for session expiration.
 - [ ] **Step 6: Run `node --test test/database.test.js test/config.test.js`; expect all migration/config tests to pass against `pg-mem`.**
-- [ ] **Step 7: Commit** the schema/bootstrap boundary.
+- [x] **Step 7: Commit** the schema/bootstrap boundary.
 
 ### Task 2: Async startup, health checks, and idempotent content/staff bootstrap
 
@@ -85,7 +85,7 @@
 - [ ] **Step 4: Update startup to migrate and initialize before listening; close the pool during graceful shutdown.** A startup database failure must exit without opening the HTTP listener.
 - [ ] **Step 5: Convert health/readiness queries to async and return 503 when PostgreSQL is unavailable.**
 - [ ] **Step 6: Run `node --test test/config.test.js test/backoffice.test.js` and verify login/session behavior passes.**
-- [ ] **Step 7: Commit** the async startup and readiness work.
+- [x] **Step 7: Commit** the async startup and readiness work.
 
 ### Task 3: Webhook and conversation persistence transactions
 
@@ -104,7 +104,7 @@
 - [ ] **Step 4: Keep event deduplication and state mutation within one transaction; send queued LINE messages only after commit.**
 - [ ] **Step 5: Convert delivery and BOT/HUMAN mode updates to async database calls; preserve locking and restart `UNKNOWN` behavior.**
 - [ ] **Step 6: Run `node --test test/webhook.test.js test/conversationConcurrency.test.js` and verify duplicate, rollback, and handoff tests pass.**
-- [ ] **Step 7: Commit** the async webhook/conversation persistence.
+- [x] **Step 7: Commit** the async webhook/conversation persistence.
 
 ### Task 4: Convert back-office, content, replies, and Rich Menu lifecycle
 
@@ -122,7 +122,7 @@
 - [ ] **Step 3: Convert auth/session, lead/message listings, staff replies, mode changes, content revisions, audit writes, and Rich Menu operations to async queries.** Use explicit `withTransaction` around multi-row publishes and mode/audit updates.
 - [ ] **Step 4: Use JSONB objects returned by `pg` without `JSON.parse`; retain safe HTML escaping.**
 - [ ] **Step 5: Run `node --test test/backoffice.test.js test/richMenu.test.js` and verify routes and Rich Menu retry/idempotency behavior pass.**
-- [ ] **Step 6: Commit** the async back-office migration.
+- [x] **Step 6: Commit** the async back-office migration.
 
 ### Task 5: Explicit opt-in local data import
 
@@ -140,7 +140,7 @@
 - [ ] **Step 3: Add `better-sqlite3` as a development-only dependency and implement the opt-in importer with a single PostgreSQL transaction and sequence reset.**
 - [ ] **Step 4: Run `node --test test/sqliteImport.test.js` and verify imported relations and IDs.**
 - [ ] **Step 5: Document backup/restore and that deployment never invokes import automatically.**
-- [ ] **Step 6: Commit** the import utility and migration documentation.
+- [x] **Step 6: Commit** the import utility and migration documentation.
 
 ### Task 6: Free-tier deployment config and full local verification
 
@@ -152,13 +152,13 @@
 - Render Blueprint uses one Free Node web service, no disk, health check `/health/ready`, and `DATABASE_URL` as an out-of-band secret.
 - Keep `NODE_ENV=production` validation meaningful: hosted production requires `DATABASE_URL`, LINE Channel Secret, LINE Channel Access Token, and staff password hash; fake LINE mode remains disabled in production.
 
-- [ ] **Step 1: Test config split:** production requires PostgreSQL and LINE/staff secrets; fake LINE mode remains local-only and cannot be enabled when `NODE_ENV=production`.
-- [ ] **Step 2: Update the Render Blueprint to remove persistent disk and paid compute; keep `DATABASE_URL` as `sync: false` and no credentials in the YAML.**
-- [ ] **Step 3: Update README/deploy guide for Supabase session-pooler connection string, SSL, migrations at startup, Render Free sleep, Supabase Free pause/500 MB/backups constraints, and the no-live-OA cutoff.**
-- [ ] **Step 4: Run `npm test`; expected all behavior, migration, import, and auth tests pass.**
-- [ ] **Step 5: Run `npm audit`, JavaScript syntax checks, `git diff --check`, and a credential scan.**
-- [ ] **Step 6: Run a local fake-mode startup/readiness and signed webhook smoke with `pg-mem`; no real Supabase/LINE credentials or OA changes.**
-- [ ] **Step 7: Commit** the deployment and documentation update.
+- [x] **Step 1: Test config split:** production requires PostgreSQL and LINE/staff secrets; fake LINE mode remains local-only and cannot be enabled when `NODE_ENV=production`.
+- [x] **Step 2: Update the Render Blueprint to remove persistent disk and paid compute; keep `DATABASE_URL` as `sync: false` and no credentials in the YAML.**
+- [x] **Step 3: Update README/deploy guide for Supabase session-pooler connection string, SSL, migrations at startup, Render Free sleep, Supabase Free pause/500 MB/backups constraints, and the no-live-OA cutoff.**
+- [x] **Step 4: Run `npm test`; expected all behavior, migration, import, and auth tests pass.**
+- [x] **Step 5: Run `npm audit`, JavaScript syntax checks, `git diff --check`, and a credential scan.**
+- [x] **Step 6: Run a local fake-mode startup/readiness and signed webhook smoke with `pg-mem`; no real Supabase/LINE credentials or OA changes.**
+- [x] **Step 7: Commit** the deployment and documentation update.
 
 ## Final verification
 
