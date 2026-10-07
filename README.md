@@ -4,7 +4,11 @@ Planning repository for the Donnar.Tech LINE Official Account customer journey, 
 
 ## Current status
 
-The repository contains planning artifacts only. No backend, webhook, database, staff inbox, or deployed automation exists yet. The LINE Official Account setup is in progress.
+The repository contains planning artifacts only. No backend, webhook, database, staff inbox, or deployed automation exists yet.
+
+The Donnar.Tech LINE Official Account has been created with Basic ID `@015ksasx`. A LINE Developers provider named `Donnar.Tech` and its Messaging API channel are active. Staff chat is enabled in manual mode and a greeting message is set. No webhook URL is configured because the backend does not exist yet. Keep the channel secret and access token outside Git.
+
+Rich Menu will be created and published by the backend through the LINE Messaging API. The draft image at [assets/line-rich-menu-1200x405.png](assets/line-rich-menu-1200x405.png) is not published on the OA.
 
 ## Planning artifacts
 
