@@ -12,6 +12,8 @@ Current [LINE add-friend link](https://lin.ee/XUuJeuz) (from OA Manager, 7 Octob
 
 Rich Menu will be created and published by the backend through the LINE Messaging API. The draft image at [assets/line-rich-menu-1200x405.png](assets/line-rich-menu-1200x405.png) is not published on the OA.
 
+The company-provided transparent logo is saved at [assets/donnar-tech-logo.png](assets/donnar-tech-logo.png) for the future back-office UI and brand assets. It has not been uploaded to the LINE OA profile.
+
 ## Planning artifacts
 
 - [Customer journey and architecture proposal](docs/donnar-line-oa-journey.html)
