@@ -4,38 +4,39 @@ Date: 2026-10-07
 
 ## Intent and current state
 
-Donnar.Tech wants greeting and automated customer messages to live in `line-backend-donnar-api`, so the team can review and change them with code. The bot assists staff with project intake; customers can ask for a person at any point. Today the repository has planning assets only. LINE OA `@015ksasx` has Messaging API enabled, but no webhook or backend exists. Its current OA Manager greeting and manual staff chat remain active until the backend is deployed and verified.
+Donnar.Tech wants the operational work to be managed in `line-backend-donnar-api`: greeting and automated replies, qualification, staff handoff, and Rich Menu creation and publication. Staff should use this project's back office for ongoing configuration, rather than editing content in LINE OA Manager. The bot assists staff with project intake; customers can ask for a person at any point. Today the repository has planning assets only. LINE OA `@015ksasx` has Messaging API enabled, but no webhook or backend exists. Its current OA Manager greeting and manual staff chat remain active until the backend is deployed and verified.
 
 ## Scope of the first backend release
 
 - Receive LINE `follow`, `message` (text), and `postback` events at `POST /webhooks/line` over HTTPS.
 - Verify `x-line-signature` against the unmodified request body before parsing or acting on events. Reject invalid signatures; acknowledge valid event batches promptly.
-- Keep greeting, qualification prompts, service descriptions, handoff confirmation, and fallback copy in version-controlled Thai message templates. Keep channel credentials in environment secrets, outside Git.
+- Provide an authenticated back-office interface to edit and preview greeting, qualification prompts, service descriptions, handoff confirmation, and fallback copy. Store published revisions in the backend database with an audit trail; seed the first Thai draft from version-controlled templates. Keep channel credentials in environment secrets, outside Git.
 - On `follow`, send the welcome text through the Messaging API. On text or postback, advance a deterministic intake flow that captures service type, project summary, budget range if volunteered, and preferred contact or next step. Persist conversation state, messages, and a lead record. Do not invent a quote or promise an SLA.
 - Recognize “คุยกับคน” and the Rich Menu handoff action in every bot state. Set the conversation to `HUMAN`, confirm once, and stop automated customer replies. Staff continue in LINE OA Manager for this release. A staff-controlled, authenticated operation returns a conversation to `BOT`; staff can view the collected summary before doing so.
-- Create, upload, and set the default Rich Menu through a separate backend setup command after webhook flows are working. Reuse the draft image in `assets/line-rich-menu-1200x405.png`; bind its three actions to actual backend-supported flows. Setup is idempotent and records the menu ID. No OA Manager Rich Menu is published.
+- Provide authenticated back-office controls to preview, create, upload, publish, and replace the default Rich Menu through Messaging API after webhook flows are working. Seed from `assets/line-rich-menu-1200x405.png`; bind its three actions to actual backend-supported flows. Publishing records the LINE menu ID and status, and prevents accidental duplicate creation. No OA Manager Rich Menu is published.
 
 ## Components and data flow
 
 1. Webhook adapter: raw-body signature check, event parsing, event ID deduplication, and fast acknowledgment.
 2. Conversation service: persisted state machine, BOT/HUMAN mode, event history, and lead updates.
-3. Message catalog: versioned text and action labels, independent of webhook/controller code.
+3. Message catalog: database-backed published revisions and version-controlled seed text, independent of webhook/controller code.
 4. LINE client: reply/push calls with timeouts, retry policy where safe, and masked logging.
-5. Staff control: authenticated read of lead summary and explicit BOT/HUMAN switching. Authentication choice and deployment environment are implementation decisions to settle in the plan.
-6. Rich Menu setup: backend-owned provisioning command using the versioned image and action mapping.
+5. Back office: authenticated content editing, preview/publish, lead summary, explicit BOT/HUMAN switching, and Rich Menu management. Authentication choice and deployment environment are implementation decisions to settle in the plan.
+6. Rich Menu service: backend-owned create/upload/set-default operations with saved menu IDs and state.
 
 Webhook events may be redelivered or arrive in batches. An event is recorded once before its business action is applied; processing and outgoing sends must account for retries without duplicating greetings or lead entries. No raw channel secret, access token, or sensitive customer message is written to application logs.
 
 ## LINE OA cutover
 
-Keep the current OA Manager greeting and manual chat while the backend is not live. Once the HTTPS webhook, signature verification, reply path, persistence, and handoff have passed a test-account run, configure the webhook URL and enable webhook delivery. Disable the OA Manager greeting and any overlapping auto-reply setting at cutover so a new follower receives one backend greeting. Confirm `follow`, text intake, Rich Menu actions, BOT → HUMAN → BOT, duplicate delivery, and staff takeover using a test account. If a live release fails, disable webhook delivery and restore the previous OA greeting/manual handling. Do not switch settings before backend deployment.
+Keep the current OA Manager greeting and manual chat while the backend is not live. Once the HTTPS webhook, signature verification, reply path, persistence, and handoff have passed a test-account run, configure the webhook URL and enable webhook delivery. The webhook endpoint can be configured by Messaging API. Disable the OA Manager greeting and any overlapping auto-reply setting at cutover so a new follower receives one backend greeting. LINE documents those two switches in OA Manager, so this one-time cutover may require that screen; routine content and Rich Menu work stays in this project's back office. Confirm `follow`, text intake, Rich Menu actions, BOT → HUMAN → BOT, duplicate delivery, and staff takeover using a test account. If a live release fails, disable webhook delivery and restore the previous OA greeting/manual handling. Do not switch settings before backend deployment.
 
 ## Acceptance criteria
 
 - A new follower receives one Thai welcome message generated by backend copy after cutover.
+- Authorized staff can edit, preview, publish, and audit greeting and reply copy in the project's back office.
 - Customer messages progress through intake and update one lead, even after event redelivery.
 - “คุยกับคน” prevents bot replies until staff explicitly return the conversation to BOT.
-- Rich Menu is provisioned by the backend and its three actions work.
+- Authorized staff can publish or replace the Rich Menu from the project's back office; its three actions work.
 - Invalid LINE signatures do not change data or trigger outbound messages.
 - Repository contains no LINE credentials; local and deployment setup explain required secrets.
 - Before cutover, current OA manual chat and greeting continue functioning.
