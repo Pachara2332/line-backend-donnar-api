@@ -1,5 +1,11 @@
 function loadConfig(env = process.env) {
   const nodeEnv = env.NODE_ENV || 'development';
+  if (nodeEnv === 'production' && !env.DATABASE_URL) {
+    throw new Error('Production requires DATABASE_URL');
+  }
+  if (env.DATABASE_URL && !/^postgres(?:ql)?:\/\//i.test(env.DATABASE_URL)) {
+    throw new Error('DATABASE_URL must be a PostgreSQL connection string');
+  }
   if (nodeEnv === 'production' && (!env.LINE_CHANNEL_SECRET || !env.LINE_CHANNEL_ACCESS_TOKEN || !env.STAFF_PASSWORD_HASH)) {
     throw new Error('Production requires LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, and STAFF_PASSWORD_HASH');
   }
@@ -13,6 +19,7 @@ function loadConfig(env = process.env) {
     nodeEnv,
     isProduction: nodeEnv === 'production',
     port,
+    databaseUrl: env.DATABASE_URL || '',
     lineChannelSecret: env.LINE_CHANNEL_SECRET || '',
     lineAccessToken: env.LINE_CHANNEL_ACCESS_TOKEN || '',
     staffUsername: env.STAFF_USERNAME || 'admin',
