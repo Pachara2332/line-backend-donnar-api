@@ -8,6 +8,8 @@ The repository contains planning artifacts only. No backend, webhook, database, 
 
 The Donnar.Tech LINE Official Account has been created with Basic ID `@015ksasx`. A LINE Developers provider named `Donnar.Tech` and its Messaging API channel are active. Staff chat is enabled in manual mode and a greeting message is set. No webhook URL is configured because the backend does not exist yet. Keep the channel secret and access token outside Git.
 
+Current [LINE add-friend link](https://lin.ee/XUuJeuz) (from OA Manager, 7 October 2026). The account currently routes inquiries to staff chat.
+
 Rich Menu will be created and published by the backend through the LINE Messaging API. The draft image at [assets/line-rich-menu-1200x405.png](assets/line-rich-menu-1200x405.png) is not published on the OA.
 
 ## Planning artifacts
