@@ -16,6 +16,31 @@ function eventId(event) {
 
 function createConversationService({ db, lineClient, liffId = '' }) {
   const conversationLocks = new Map();
+  const profileRefreshes = new Map();
+
+  async function refreshLineProfile(userId, { force = false } = {}) {
+    if (!lineClient.getProfile) return;
+    if (profileRefreshes.has(userId)) return profileRefreshes.get(userId);
+    const refresh = (async () => {
+      try {
+        const { rows } = await db.query('SELECT profile_synced_at FROM line_users WHERE line_user_id = $1', [userId]);
+        const lastSync = rows[0]?.profile_synced_at ? new Date(rows[0].profile_synced_at).getTime() : 0;
+        if (!rows[0] || (!force && lastSync && Date.now() - lastSync < 24 * 60 * 60 * 1000)) return;
+        const profile = await lineClient.getProfile(userId);
+        if (profile === null) {
+          await db.query('UPDATE line_users SET profile_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE line_user_id = $1', [userId]);
+          return;
+        }
+        if (typeof profile?.displayName !== 'string' || !profile.displayName.trim()) return;
+        await db.query('UPDATE line_users SET display_name = $1, picture_url = $2, profile_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE line_user_id = $3', [profile.displayName, typeof profile.pictureUrl === 'string' ? profile.pictureUrl : null, userId]);
+      } catch {
+        // Profile lookup is optional CRM metadata and must not affect messaging.
+      }
+    })();
+    profileRefreshes.set(userId, refresh);
+    try { await refresh; }
+    finally { if (profileRefreshes.get(userId) === refresh) profileRefreshes.delete(userId); }
+  }
 
   async function withConversationLock(conversationId, operation) {
     const lockKey = String(conversationId);
@@ -171,6 +196,9 @@ function createConversationService({ db, lineClient, liffId = '' }) {
     });
     const userId = event?.source?.userId;
     if (userId) await deliverPending(id, userId);
+    if (inserted && userId && ['follow', 'message', 'postback'].includes(event?.type)) {
+      await refreshLineProfile(userId, { force: event.type === 'follow' });
+    }
     return inserted ? result : { duplicate: true };
   }
 
