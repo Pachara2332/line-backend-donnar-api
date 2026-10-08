@@ -26,6 +26,24 @@ class LineMessagingClient {
     return response.json();
   }
 
+  async getProfile(userId) {
+    if (!this.accessToken) throw new Error('LINE access token is not configured');
+    const response = await this.fetchImpl(`${LINE_API}/profile/${encodeURIComponent(userId)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${this.accessToken}` },
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      const error = new Error(`LINE API returned HTTP ${response.status}`);
+      error.status = response.status;
+      error.retryable = response.status === 429 || response.status >= 500;
+      throw error;
+    }
+    const profile = await response.json();
+    return { displayName: profile.displayName, pictureUrl: profile.pictureUrl };
+  }
+
   reply(replyToken, messages) {
     return this.request('/message/reply', { replyToken, messages: messages.slice(0, 5) });
   }
@@ -55,11 +73,15 @@ class LineMessagingClient {
 }
 
 class FakeLineMessagingClient {
-  constructor() { this.sent = []; this.menus = []; }
+  constructor() { this.sent = []; this.menus = []; this.profileRequests = []; }
+  async getProfile(userId) {
+    this.profileRequests.push(userId);
+    return { displayName: 'Test LINE user', pictureUrl: 'https://example.test/profile.png' };
+  }
   async reply(replyToken, messages) { this.sent.push({ kind: 'reply', replyToken, messages }); return {}; }
   async push(userId, messages) { this.sent.push({ kind: 'push', userId, messages }); return {}; }
   async createRichMenu(menu) { const id = `richmenu-test-${this.menus.length + 1}`; this.menus.push({ id, menu }); return { richMenuId: id }; }
-  async uploadRichMenuImage(menuId, image, contentType) { this.uploaded = { menuId, imageBytes: image.length, contentType }; }
+  async uploadRichMenuImage(menuId, image, contentType) { this.uploaded = { menuId, imageBytes: image.length, image: Buffer.from(image), contentType }; }
   async setDefaultRichMenu(menuId) { this.defaultMenuId = menuId; }
 }
 

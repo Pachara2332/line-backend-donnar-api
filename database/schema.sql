@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS webhook_events (
 CREATE TABLE IF NOT EXISTS line_users (
   line_user_id TEXT PRIMARY KEY,
   display_name TEXT,
+  picture_url TEXT,
+  profile_synced_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -74,6 +76,8 @@ CREATE TABLE IF NOT EXISTS rich_menu_publications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   line_menu_id TEXT,
   image_uploaded INTEGER NOT NULL DEFAULT 0 CHECK (image_uploaded IN (0, 1)),
+  image_data BLOB,
+  image_content_type TEXT,
   status TEXT NOT NULL CHECK (status IN ('DRAFT', 'CREATING', 'PUBLISHED', 'FAILED', 'REPLACED')),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   published_at TEXT
@@ -95,3 +99,4 @@ CREATE TABLE IF NOT EXISTS staff_sessions (
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_leads_updated ON leads(updated_at);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rich_menu_single_draft ON rich_menu_publications(status) WHERE status = 'DRAFT';

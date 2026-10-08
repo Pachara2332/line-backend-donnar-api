@@ -40,7 +40,7 @@ test('requires a staff session and CSRF token for back-office changes', async (t
   assert.equal((await request(app).get('/admin')).status, 303);
   const { cookie, page, csrf } = await login(app);
   assert.equal(page.status, 200);
-  assert.match(page.text, /Donnar\.Tech · LINE Back Office/);
+  assert.match(page.text, /CRM Inbox · Donnar\.Tech/);
 
   const rejected = await request(app).post('/admin/conversations/1/mode').set('cookie', cookie).type('form').send({ mode: 'HUMAN', _csrf: 'wrong' });
   assert.equal(rejected.status, 403);
