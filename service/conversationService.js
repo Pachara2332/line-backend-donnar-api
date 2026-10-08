@@ -107,7 +107,10 @@ function createConversationService({ db, lineClient, liffId = '' }) {
     await client.query('INSERT INTO conversations(line_user_id) VALUES ($1) ON CONFLICT (line_user_id) DO NOTHING', [userId]);
     const { rows: conversations } = await client.query('SELECT * FROM conversations WHERE line_user_id = $1', [userId]);
     const conversation = conversations[0];
-    await client.query('INSERT INTO leads(conversation_id, source) VALUES ($1, NULL) ON CONFLICT (conversation_id) DO NOTHING', [conversation.id]);
+    const leadCreated = await client.query('INSERT INTO leads(conversation_id, source) VALUES ($1, NULL) ON CONFLICT (conversation_id) DO NOTHING RETURNING id', [conversation.id]);
+    if (leadCreated.rowCount) {
+      await client.query("INSERT INTO staff_notifications(type, conversation_id) VALUES ('new_lead', $1) ON CONFLICT (type, conversation_id) DO NOTHING", [conversation.id]);
+    }
 
     async function queueMessage(message, allowHumanMode = false) {
       if (!message) return;
@@ -238,7 +241,10 @@ function createConversationService({ db, lineClient, liffId = '' }) {
       await client.query('INSERT INTO conversations(line_user_id) VALUES ($1) ON CONFLICT (line_user_id) DO NOTHING', [userId]);
       const { rows } = await client.query('SELECT * FROM conversations WHERE line_user_id = $1', [userId]);
       const conversation = rows[0];
-      await client.query("INSERT INTO leads(conversation_id, source) VALUES ($1, 'liff') ON CONFLICT (conversation_id) DO NOTHING", [conversation.id]);
+      const leadCreated = await client.query("INSERT INTO leads(conversation_id, source) VALUES ($1, 'liff') ON CONFLICT (conversation_id) DO NOTHING RETURNING id", [conversation.id]);
+      if (leadCreated.rowCount) {
+        await client.query("INSERT INTO staff_notifications(type, conversation_id) VALUES ('new_lead', $1) ON CONFLICT (type, conversation_id) DO NOTHING", [conversation.id]);
+      }
       await client.query("UPDATE leads SET requirements_json = $1::jsonb, status = CASE WHEN status = 'HUMAN_REQUIRED' THEN status ELSE 'QUALIFIED' END, updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $2", [JSON.stringify(brief), conversation.id]);
       await client.query("UPDATE conversations SET current_step = 'complete', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
       await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id) VALUES ($1, 'IN', 'liff_intake', $2, $3)", [conversation.id, summary, id]);

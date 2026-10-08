@@ -41,6 +41,7 @@ test('saves a verified brief to the token owner lead and confirms in chat once',
   assert.equal(leads[0].current_step, 'complete');
   assert.equal(leads[0].requirements_json.projectSummary, 'แก้ไขโจทย์');
   assert.equal(leads[0].requirements_json.contactPreference, 'แชต LINE');
+  assert.equal(Number((await db.query('SELECT COUNT(*) AS count FROM staff_notifications WHERE type = $1', ['new_lead'])).rows[0].count), 1);
   assert.equal(sent.length, 2);
   assert.equal(sent[0].userId, USER);
   await close();

@@ -9,6 +9,21 @@ async function createTestDatabase({ migrate = true, config = {} } = {}) {
   const poolQuery = pool.query.bind(pool);
   let richMenuClaimLock = Promise.resolve();
   pool.query = async (sql, params) => {
+    if (/^\s*SELECT DISTINCT ON \(conversation_id\)/i.test(String(sql))) {
+      const direction = String(sql).match(/direction = '(IN|OUT)'/i)?.[1]?.toUpperCase();
+      const sentOnly = /send_status = 'SENT'/i.test(String(sql));
+      const { rows } = await poolQuery('SELECT id, conversation_id, direction, body, send_status, created_at FROM messages ORDER BY conversation_id, created_at DESC, id DESC');
+      const latest = new Map();
+      for (const row of rows) {
+        if (direction && row.direction !== direction) continue;
+        if (sentOnly && row.send_status !== 'SENT') continue;
+        const key = String(row.conversation_id);
+        const previous = latest.get(key);
+        if (!previous || new Date(row.created_at) > new Date(previous.created_at)
+          || (new Date(row.created_at).getTime() === new Date(previous.created_at).getTime() && Number(row.id) > Number(previous.id))) latest.set(key, row);
+      }
+      return { rows: [...latest.values()], rowCount: latest.size, command: 'SELECT' };
+    }
     if (/^\s*DELETE FROM rich_menu_publications WHERE id = \$1 AND status = 'DRAFT'/i.test(String(sql))) {
       const { rows } = await poolQuery('SELECT id, status FROM rich_menu_publications WHERE id = $1', params);
       if (rows[0]?.status !== 'DRAFT') return { rows: [], rowCount: 0, command: 'DELETE' };
