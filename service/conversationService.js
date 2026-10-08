@@ -17,15 +17,16 @@ function createConversationService({ db, lineClient }) {
   const conversationLocks = new Map();
 
   async function withConversationLock(conversationId, operation) {
-    const previous = conversationLocks.get(conversationId) || Promise.resolve();
+    const lockKey = String(conversationId);
+    const previous = conversationLocks.get(lockKey) || Promise.resolve();
     let release;
     const current = new Promise((resolve) => { release = resolve; });
-    conversationLocks.set(conversationId, current);
+    conversationLocks.set(lockKey, current);
     await previous;
     try { return await operation(); }
     finally {
       release();
-      if (conversationLocks.get(conversationId) === current) conversationLocks.delete(conversationId);
+      if (conversationLocks.get(lockKey) === current) conversationLocks.delete(lockKey);
     }
   }
 
@@ -150,7 +151,7 @@ function createConversationService({ db, lineClient }) {
       return true;
     });
     const userId = event?.source?.userId;
-    if (inserted && userId) await deliverPending(id, userId);
+    if (userId) await deliverPending(id, userId);
     return inserted ? result : { duplicate: true };
   }
 

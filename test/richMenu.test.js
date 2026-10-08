@@ -46,7 +46,8 @@ test('publishes through the fake adapter and requires explicit confirmation to r
   assert.equal(lineClient.menus.length, 1);
   assert.equal(lineClient.defaultMenuId, 'richmenu-test-1');
   assert.equal((await db.query("SELECT status FROM rich_menu_publications WHERE id = 1")).rows[0].status, 'PUBLISHED');
-  assert.equal((await publish()).status, 409);
+  const duplicatePublish = await publish();
+  assert.equal(duplicatePublish.status, 409, duplicatePublish.text);
   assert.equal(lineClient.menus.length, 1);
   const confirmation = await publish();
   const currentId = confirmation.text.match(/name="replace_current_id" value="(\d+)"/)[1];
@@ -55,7 +56,7 @@ test('publishes through the fake adapter and requires explicit confirmation to r
   assert.equal(lineClient.menus.length, 2);
   assert.equal((await request(app).post('/admin/rich-menu/publish').set('cookie', cookie).type('form').send({ _csrf: csrf, replace: '1', replace_current_id: currentId })).status, 409);
   assert.equal(lineClient.menus.length, 2);
-  assert.equal(Number((await db.query("SELECT COUNT(*) AS count FROM rich_menu_publications WHERE status = 'PUBLISHED'")).rows[0].count), 1);
+  assert.equal((await db.query('SELECT status FROM rich_menu_publications')).rows.filter((row) => row.status === 'PUBLISHED').length, 1);
 });
 
 test('resumes a failed publication with its saved LINE menu ID instead of creating a duplicate', async (t) => {
@@ -73,7 +74,31 @@ test('resumes a failed publication with its saved LINE menu ID instead of creati
   assert.equal((await publish()).status, 303);
   assert.equal(lineClient.menus.length, 1);
   assert.equal(lineClient.defaultMenuId, saved.line_menu_id);
-  assert.equal(Number((await db.query("SELECT COUNT(*) AS count FROM rich_menu_publications WHERE status = 'PUBLISHED'")).rows[0].count), 1);
+  assert.equal((await db.query('SELECT status FROM rich_menu_publications')).rows.filter((row) => row.status === 'PUBLISHED').length, 1);
+});
+
+test('allows only one Rich Menu create when two staff publish requests race', async (t) => {
+  const { db, lineClient, app, cookie, csrf } = await setup(t);
+  const query = db.query.bind(db);
+  let creatingReads = 0;
+  let releaseReads;
+  const bothReadsComplete = new Promise((resolve) => { releaseReads = resolve; });
+  db.query = async (sql, params) => {
+    const result = await query(sql, params);
+    if (String(sql).includes("SELECT id FROM rich_menu_publications WHERE status = 'CREATING'")) {
+      creatingReads += 1;
+      if (creatingReads === 2) releaseReads();
+      await bothReadsComplete;
+    }
+    return result;
+  };
+  const publish = () => request(app).post('/admin/rich-menu/publish').set('cookie', cookie).type('form').send({ _csrf: csrf });
+
+  const responses = await Promise.all([publish(), publish()]);
+
+  assert.deepEqual(responses.map((response) => response.status).sort(), [303, 409]);
+  assert.equal(lineClient.menus.length, 1);
+  assert.equal((await db.query('SELECT status FROM rich_menu_publications')).rows.filter((row) => ['PUBLISHED', 'CREATING'].includes(row.status)).length, 1);
 });
 
 test('recovers interrupted publication state on database restart', async (t) => {

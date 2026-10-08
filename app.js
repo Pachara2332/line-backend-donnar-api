@@ -143,7 +143,8 @@ function buildApp({ db, lineClient, config }) {
       if (failed && !failed.line_menu_id) return res.status(409).send('ผลการสร้างเมนูครั้งก่อนยังไม่แน่ชัด กรุณาตรวจ Rich Menu ใน LINE ก่อนเริ่มใหม่');
       if (failed) {
         publicationId = failed.id;
-        await db.query("UPDATE rich_menu_publications SET status = 'CREATING' WHERE id = $1", [publicationId]);
+        const claimed = await db.query("UPDATE rich_menu_publications SET status = 'CREATING' WHERE id = $1 AND status = 'FAILED' RETURNING id", [publicationId]);
+        if (!claimed.rowCount) return res.status(409).send('มีการเผยแพร่ Rich Menu กำลังดำเนินการอยู่');
       } else {
         const { rows } = await db.query("INSERT INTO rich_menu_publications(status) VALUES ('CREATING') RETURNING id");
         publicationId = rows[0].id;
@@ -167,6 +168,7 @@ function buildApp({ db, lineClient, config }) {
       });
       return res.redirect(303, '/admin');
     } catch (error) {
+      if (error.code === '23505') return res.status(409).send('มีการเผยแพร่ Rich Menu กำลังดำเนินการอยู่');
       if (publicationId) await db.query("UPDATE rich_menu_publications SET status = 'FAILED' WHERE id = $1 AND status = 'CREATING'", [publicationId]).catch(() => {});
       return next(error);
     }

@@ -93,3 +93,4 @@ CREATE TABLE IF NOT EXISTS staff_sessions (
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_leads_updated ON leads(updated_at);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rich_menu_single_creation ON rich_menu_publications((status)) WHERE status = 'CREATING';
