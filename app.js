@@ -319,7 +319,7 @@ async function adminPage(db, staff, csrfToken, query = {}) {
   const messageBubbles = selectedMessages.map((message) => {
     const pending = message.direction === 'OUT' && !['SENT', 'CANCELLED'].includes(message.send_status);
     const delivery = pending ? ` · ${escapeHtml(message.send_status)}${message.last_error ? ` (${escapeHtml(message.last_error)})` : ''}` : '';
-    return `<div class="message ${message.direction === 'IN' ? 'in' : 'out'}"><div class="message-meta">${message.direction === 'IN' ? 'ลูกค้า' : 'Donnar.Tech'} · ${escapeHtml(message.created_at)}${delivery}</div>${escapeHtml(readMessage(message.body))}</div>`;
+    return `<div class="message ${message.direction === 'IN' ? 'in' : 'out'}"><div class="message-meta">${message.direction === 'IN' ? 'ลูกค้า' : 'Donnar.Tech'} · ${escapeHtml(formatAdminDateTime(message.created_at))}${delivery}</div>${escapeHtml(readMessage(message.body))}</div>`;
   }).join('');
   const detail = selected ? `<section class="inbox-detail"><div class="detail-head"><div><h2>ลูกค้า #${escapeHtml(selected.conversation_id)}</h2><div class="muted" style="font-size:13px">LINE UID: ${escapeHtml(selected.line_user_id)}</div><div style="margin-top:9px"><span class="tag">${escapeHtml(statusLabels[selected.status] || selected.status)}</span> <span class="mode-tag ${selected.mode === 'HUMAN' ? 'human' : 'bot'}">${selected.mode === 'HUMAN' ? 'พนักงานดูแล' : 'บอตดูแล'}</span></div></div><form method="post" action="/admin/conversations/${selected.conversation_id}/mode"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="mode" value="${selected.mode === 'BOT' ? 'HUMAN' : 'BOT'}"><button class="${selected.mode === 'BOT' ? '' : 'secondary'}">${selected.mode === 'BOT' ? 'รับช่วงตอบลูกค้า' : 'ส่งคืนให้บอต'}</button></form></div><div class="detail-grid"><div class="message-history">${messageBubbles || '<div class="empty-state"><div class="empty-icon">💬</div>ยังไม่มีข้อความในบทสนทนา</div>'}</div><aside class="lead-details"><div class="detail-label">รายละเอียดโปรเจกต์</div>${requirementRows}<div class="requirement"><b>ขั้นตอนปัจจุบัน</b>${escapeHtml(stepLabels[selected.current_step] || selected.current_step)}</div><div class="requirement"><b>สถานะ Lead</b>${escapeHtml(statusLabels[selected.status] || selected.status)}</div></aside></div><div class="composer">${selected.mode === 'HUMAN' ? `<form method="post" action="/admin/conversations/${selected.conversation_id}/reply"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><textarea name="text" maxlength="2000" placeholder="พิมพ์ข้อความตอบลูกค้า…" aria-label="ข้อความตอบลูกค้า" required></textarea><button type="submit">ส่งข้อความ <span aria-hidden="true">➤</span></button></form><p class="composer-help">กด “ส่งคืนให้บอต” เมื่อพร้อมให้บอตดูแลบทสนทนาต่อ</p>` : '<div class="danger-note">บอตกำลังดูแลบทสนทนานี้ หากต้องการตอบลูกค้า ให้กด “รับช่วงตอบลูกค้า” ก่อน</div>'}</div></section>` : '<section class="inbox-detail empty-state"><div class="empty-icon">🔎</div><h2>ไม่พบ lead ที่ตรงกับตัวกรอง</h2><p>ลองเปลี่ยนคำค้นหาหรือล้างตัวกรอง</p></section>';
   const publishedCopy = new Map(revisions.filter((item) => item.status === 'PUBLISHED').map((item) => [item.message_key, item.body]));
@@ -336,6 +336,12 @@ async function adminPage(db, staff, csrfToken, query = {}) {
 
 function readMessage(body) {
   try { const parsed = JSON.parse(body); return parsed.text || parsed.altText || (parsed.type === 'flex' ? 'การ์ดต้อนรับ' : body); } catch { return body; }
+}
+
+function formatAdminDateTime(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value || '');
+  return new Intl.DateTimeFormat('th-TH', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Bangkok' }).format(date);
 }
 
 function validateRichMenuImage(image) {
