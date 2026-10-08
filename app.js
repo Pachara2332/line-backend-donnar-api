@@ -359,7 +359,7 @@ function loginPage(error = '') {
 }
 
 async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResult = null } = {}) {
-  const [{ rows: leads }, { rows: revisions }, { rows: menus }, { rows: notifications }, { rows: unreadCountRows }, { rows: latestInboundMessages }, { rows: latestSentMessages }] = await Promise.all([
+  const [{ rows: leads }, { rows: revisions }, { rows: menus }, { rows: notifications }, { rows: unreadCountRows }, { rows: waitingLeads }] = await Promise.all([
     db.query(`SELECT l.*, c.id AS conversation_id, c.mode, c.current_step, c.line_user_id, u.display_name, u.picture_url, u.profile_synced_at FROM leads l JOIN conversations c ON c.id = l.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id ORDER BY l.updated_at DESC`),
     db.query('SELECT * FROM message_revisions ORDER BY message_key, revision DESC'),
     db.query('SELECT id, line_menu_id, image_uploaded, image_content_type, status, created_at, published_at FROM rich_menu_publications ORDER BY id DESC LIMIT 10'),
@@ -367,21 +367,23 @@ async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResul
       FROM staff_notifications n JOIN leads l ON l.conversation_id = n.conversation_id JOIN conversations c ON c.id = n.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id
       WHERE n.type = 'new_lead' AND n.read_at IS NULL ORDER BY n.created_at DESC, n.id DESC LIMIT 10`),
     db.query("SELECT COUNT(*)::integer AS count FROM staff_notifications WHERE type = 'new_lead' AND read_at IS NULL"),
-    db.query(`SELECT DISTINCT ON (conversation_id) id, conversation_id, direction, body, created_at FROM messages WHERE direction = 'IN' ORDER BY conversation_id, created_at DESC, id DESC`),
-    db.query(`SELECT DISTINCT ON (conversation_id) id, conversation_id, direction, body, created_at FROM messages WHERE direction = 'OUT' AND send_status = 'SENT' ORDER BY conversation_id, created_at DESC, id DESC`),
+    db.query(`SELECT l.*, c.id AS conversation_id, c.mode, c.current_step, c.line_user_id, u.display_name, u.picture_url, u.profile_synced_at,
+        inbound.id AS waiting_message_id, inbound.body AS waiting_body, inbound.created_at AS waiting_since
+      FROM leads l JOIN conversations c ON c.id = l.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id
+      JOIN LATERAL (
+        SELECT m.id, m.body, m.created_at FROM messages m
+        WHERE m.conversation_id = c.id AND m.direction = 'IN'
+        ORDER BY m.created_at DESC, m.id DESC LIMIT 1
+      ) inbound ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT m.id, m.created_at FROM messages m
+        WHERE m.conversation_id = c.id AND m.direction = 'OUT' AND m.send_status = 'SENT'
+        ORDER BY m.created_at DESC, m.id DESC LIMIT 1
+      ) sent ON TRUE
+      WHERE sent.id IS NULL OR (sent.created_at, sent.id) < (inbound.created_at, inbound.id)
+      ORDER BY inbound.created_at ASC, inbound.id ASC`),
   ]);
 
-  const latestInboundByConversation = new Map(latestInboundMessages.map((message) => [String(message.conversation_id), message]));
-  const latestSentByConversation = new Map(latestSentMessages.map((message) => [String(message.conversation_id), message]));
-  const waitingLeads = leads.flatMap((lead) => {
-    const key = String(lead.conversation_id);
-    const inbound = latestInboundByConversation.get(key);
-    const sent = latestSentByConversation.get(key);
-    if (!inbound) return [];
-    const sentIsLater = sent && (new Date(sent.created_at) > new Date(inbound.created_at)
-      || (new Date(sent.created_at).getTime() === new Date(inbound.created_at).getTime() && Number(sent.id) > Number(inbound.id)));
-    return sentIsLater ? [] : [{ ...lead, waiting_message_id: inbound.id, waiting_body: inbound.body, waiting_since: inbound.created_at }];
-  }).sort((a, b) => new Date(a.waiting_since) - new Date(b.waiting_since) || Number(a.waiting_message_id) - Number(b.waiting_message_id));
   const visibleLeads = leads.slice(0, 100);
   const messagesByConversation = new Map();
   for (const lead of visibleLeads) {
