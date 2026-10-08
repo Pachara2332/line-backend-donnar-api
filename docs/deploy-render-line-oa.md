@@ -34,7 +34,7 @@ Put the printed scrypt hash directly into Render as `STAFF_PASSWORD_HASH`. Do no
 1. In the Messaging API channel associated with the Donnar.Tech Official Account, set the webhook URL to `https://<service-host>/webhooks/line`.
 2. Verify the webhook. Check the Render health endpoint if the verification fails; do not weaken signature checks.
 3. Enable **Use webhook** only after verification. Keep the previous greeting and OA auto-replies in mind while testing, since they may overlap.
-4. Use a test account to verify follow greeting, duplicate delivery, text qualification, Rich Menu postbacks, BOT → HUMAN → BOT, staff replies, and invalid signature rejection.
+4. Use a test account to verify follow greeting, duplicate delivery, text qualification, all three Rich Menu message actions, BOT → HUMAN → BOT, staff replies, and invalid signature rejection.
 5. After validation, disable the overlapping greeting/auto-reply in LINE OA Manager so customers receive only one greeting.
 
 ## 5. Preview and publish Rich Menu

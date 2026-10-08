@@ -36,7 +36,7 @@ test('accepts only the taller 2500 by 1686 PNG image within LINE limits', () => 
   assert.equal(validateRichMenuImage(Buffer.from('not a png')), false);
 });
 
-test('creates three full-width stacked actions at the same coordinates as the image', () => {
+test('creates three full-width stacked message actions at the same coordinates as the image', () => {
   const menu = buildRichMenu();
   assert.deepEqual(menu.size, { width: 2500, height: 1686 });
   assert.equal(menu.areas.length, 3);
@@ -45,7 +45,8 @@ test('creates three full-width stacked actions at the same coordinates as the im
     [0, 562, 2500, 562],
     [0, 1124, 2500, 562],
   ]);
-  assert.deepEqual(menu.areas.map((area) => new URLSearchParams(area.action.data).get('action')), ['START_QUALIFY', 'SERVICES', 'HUMAN']);
+  assert.deepEqual(menu.areas.map((area) => area.action.type), ['message', 'message', 'message']);
+  assert.deepEqual(menu.areas.map((area) => area.action.text), ['เริ่มปรึกษาโปรเจกต์', 'ขอดูบริการ', 'คุยกับคน']);
   assert.equal(Object.hasOwn(menu, 'baseUrl'), false);
 });
 

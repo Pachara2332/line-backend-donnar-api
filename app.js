@@ -287,16 +287,16 @@ function validateRichMenuImage(image) {
 
 function buildRichMenu() {
   return { size: { width: 2500, height: 1686 }, selected: true, name: 'Donnar Tech main menu', chatBarText: 'เมนู', areas: [
-    { bounds: { x: 0, y: 0, width: 2500, height: 562 }, action: { type: 'postback', label: 'ปรึกษาโปรเจกต์', data: 'action=START_QUALIFY', displayText: 'อยากปรึกษาโปรเจกต์' } },
-    { bounds: { x: 0, y: 562, width: 2500, height: 562 }, action: { type: 'postback', label: 'บริการของเรา', data: 'action=SERVICES', displayText: 'ขอดูบริการ' } },
-    { bounds: { x: 0, y: 1124, width: 2500, height: 562 }, action: { type: 'postback', label: 'คุยกับทีม', data: 'action=HUMAN', displayText: 'คุยกับคน' } },
+    { bounds: { x: 0, y: 0, width: 2500, height: 562 }, action: { type: 'message', label: 'เริ่มโปรเจกต์', text: 'เริ่มปรึกษาโปรเจกต์' } },
+    { bounds: { x: 0, y: 562, width: 2500, height: 562 }, action: { type: 'message', label: 'บริการของเรา', text: 'ขอดูบริการ' } },
+    { bounds: { x: 0, y: 1124, width: 2500, height: 562 }, action: { type: 'message', label: 'คุยกับทีม', text: 'คุยกับคน' } },
   ] };
 }
 
 function menuPreview(baseUrl) {
   const image = '/assets/line-rich-menu-2500x1686.png';
   const menu = buildRichMenu();
-  return shell('Rich Menu preview', `<section class="card"><h1>ตัวอย่าง Rich Menu</h1><p>สามปุ่ม: ปรึกษาโปรเจกต์, บริการของเรา, คุยกับทีม</p><img src="${image}" alt="Donnar.Tech Rich Menu" style="width:100%;height:auto"><p>การกดเมนูจริงจะส่ง postback ไปที่ backend; ปุ่มคุยกับทีมจะหยุดบอตทันที</p><pre>${escapeHtml(JSON.stringify(menu.areas.map((area) => area.action), null, 2))}</pre><a class="button" href="/admin">กลับหน้าหลังบ้าน</a></section>`);
+  return shell('Rich Menu preview', `<section class="card"><h1>ตัวอย่าง Rich Menu</h1><p>สามปุ่ม: เริ่มโปรเจกต์, บริการของเรา, คุยกับทีม</p><img src="${image}" alt="Donnar.Tech Rich Menu" style="width:100%;height:auto"><p>แตะแล้วข้อความจะปรากฏในแชตและ backend ตอบตามหัวข้อ; ปุ่มคุยกับทีมจะหยุดบอตทันที</p><pre>${escapeHtml(JSON.stringify(menu.areas.map((area) => area.action), null, 2))}</pre><a class="button" href="/admin">กลับหน้าหลังบ้าน</a></section>`);
 }
 
 module.exports = { buildApp, buildRichMenu, validateRichMenuImage, verifyPassword, hashToken };

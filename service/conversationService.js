@@ -122,6 +122,16 @@ function createConversationService({ db, lineClient }) {
     if (event.type !== 'message' || event.message?.type !== 'text') return { processed: true };
     const text = incomingText.trim();
     if (!text) return { processed: true };
+    if (/^(เริ่มปรึกษาโปรเจกต์|ปรึกษาโปรเจกต์)$/i.test(text)) {
+      await client.query("UPDATE conversations SET current_step = 'serviceType', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
+      await client.query("UPDATE leads SET requirements_json = '{}'::jsonb, status = 'QUALIFYING', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1", [conversation.id]);
+      await queueReply(await getCopy(client, 'serviceType'));
+      return { processed: true };
+    }
+    if (/^(ขอดูบริการ|บริการของเรา|services)$/i.test(text)) {
+      await queueReply(await getCopy(client, 'services'));
+      return { processed: true };
+    }
     if (conversation.current_step === 'serviceType' && /^services$/i.test(text)) {
       await queueReply(await getCopy(client, 'services'));
       return { processed: true };
