@@ -8,10 +8,11 @@ const { createLineSignatureMiddleware } = require('./middleware/webhookValidatio
 const { createConversationService } = require('./service/conversationService');
 const { DEFAULT_COPY } = require('./service/messageCatalog');
 const { withTransaction } = require('./database');
+const { verifyIdToken, parseIntake, intakePage, channelIdFromLiffId } = require('./service/liffIntake');
 
-function buildApp({ db, lineClient, config }) {
+function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
   const app = express();
-  const conversations = createConversationService({ db, lineClient });
+  const conversations = createConversationService({ db, lineClient, liffId: config.liffId });
   app.locals.lineClient = lineClient;
 
   app.disable('x-powered-by');
@@ -21,6 +22,25 @@ function buildApp({ db, lineClient, config }) {
   app.get('/health/ready', async (req, res) => {
     try { await db.query('SELECT 1'); return res.json({ status: 'ready' }); }
     catch { return res.status(503).json({ status: 'not_ready' }); }
+  });
+
+  app.get('/liff/intake', (req, res) => {
+    if (!config.liffId) return res.status(503).type('html').send('<!doctype html><meta charset="utf-8"><p>ฟอร์มยังไม่พร้อมใช้งาน</p>');
+    const nonce = randomBytes(16).toString('base64');
+    res.setHeader('Content-Security-Policy', `default-src 'self'; script-src 'nonce-${nonce}' https://static.line-scdn.net; connect-src 'self' https://*.line.me https://*.line-scdn.net; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'`);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.type('html').send(intakePage(config.liffId, nonce));
+  });
+  app.post('/api/intake/project', rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false }), express.json({ limit: '16kb' }), async (req, res, next) => {
+    try {
+      if (!config.liffId) return res.status(503).json({ error: 'LIFF is not configured' });
+      const identity = await verifyLiffToken(req.body?.idToken, channelIdFromLiffId(config.liffId));
+      if (!identity) return res.status(401).json({ error: 'LINE session could not be verified' });
+      const intake = parseIntake(req.body);
+      if (!intake) return res.status(400).json({ error: 'Invalid project brief' });
+      const result = await conversations.submitIntake(identity.userId, intake.submissionId, intake.brief, intake.summary);
+      return res.json({ saved: true, confirmationSent: result.confirmationSent });
+    } catch (error) { return next(error); }
   });
 
   app.post('/webhooks/line', express.raw({ type: 'application/json', limit: '1mb' }), createLineSignatureMiddleware(config.lineChannelSecret), async (req, res, next) => {
@@ -125,7 +145,7 @@ function buildApp({ db, lineClient, config }) {
       res.redirect(303, '/admin');
     } catch (error) { next(error); }
   });
-  app.post('/admin/rich-menu/preview', requireCsrf, (req, res) => res.type('html').send(menuPreview(config.publicBaseUrl)));
+  app.post('/admin/rich-menu/preview', requireCsrf, (req, res) => res.type('html').send(menuPreview(config.publicBaseUrl, config.liffId)));
   app.post('/admin/rich-menu/publish', requireCsrf, async (req, res, next) => {
     let publicationId;
     try {
@@ -151,7 +171,7 @@ function buildApp({ db, lineClient, config }) {
       }
       let richMenuId = failed?.line_menu_id;
       if (!richMenuId) {
-        const created = await lineClient.createRichMenu(buildRichMenu());
+        const created = await lineClient.createRichMenu(buildRichMenu(config.liffId));
         if (typeof created?.richMenuId !== 'string' || !created.richMenuId.startsWith('richmenu-')) throw new Error('LINE did not return a valid rich menu ID');
         richMenuId = created.richMenuId;
         await db.query('UPDATE rich_menu_publications SET line_menu_id = $1 WHERE id = $2', [richMenuId, publicationId]);
@@ -313,18 +333,18 @@ function readJpegDimensions(image) {
   return null;
 }
 
-function buildRichMenu() {
+function buildRichMenu(liffId = '') {
   return { size: { width: 2500, height: 1686 }, selected: true, name: 'Donnar Tech main menu', chatBarText: 'เมนู', areas: [
-    { bounds: { x: 0, y: 0, width: 2500, height: 562 }, action: { type: 'message', label: 'เริ่มโปรเจกต์', text: 'เริ่มปรึกษาโปรเจกต์' } },
+    { bounds: { x: 0, y: 0, width: 2500, height: 562 }, action: liffId ? { type: 'uri', label: 'เริ่มโปรเจกต์', uri: `https://liff.line.me/${liffId}` } : { type: 'message', label: 'เริ่มโปรเจกต์', text: 'เริ่มปรึกษาโปรเจกต์' } },
     { bounds: { x: 0, y: 562, width: 2500, height: 562 }, action: { type: 'message', label: 'บริการของเรา', text: 'ขอดูบริการ' } },
     { bounds: { x: 0, y: 1124, width: 2500, height: 562 }, action: { type: 'message', label: 'คุยกับทีม', text: 'คุยกับคน' } },
   ] };
 }
 
-function menuPreview(baseUrl) {
+function menuPreview(baseUrl, liffId) {
   const image = '/assets/line-rich-menu-2500x1686.jpg?v=20261008-new-art-114840';
-  const menu = buildRichMenu();
-  return shell('Rich Menu preview', `<section class="card"><h1>ตัวอย่าง Rich Menu</h1><p>สามปุ่ม: เริ่มโปรเจกต์, บริการของเรา, คุยกับทีม</p><img src="${image}" alt="Donnar.Tech Rich Menu" style="width:100%;height:auto"><p>แตะแล้วข้อความจะปรากฏในแชตและ backend ตอบตามหัวข้อ; ปุ่มคุยกับทีมจะหยุดบอตทันที</p><pre>${escapeHtml(JSON.stringify(menu.areas.map((area) => area.action), null, 2))}</pre><a class="button" href="/admin">กลับหน้าหลังบ้าน</a></section>`);
+  const menu = buildRichMenu(liffId);
+  return shell('Rich Menu preview', `<section class="card"><h1>ตัวอย่าง Rich Menu</h1><p>สามปุ่ม: เริ่มโปรเจกต์, บริการของเรา, คุยกับทีม</p><img src="${image}" alt="Donnar.Tech Rich Menu" style="width:100%;height:auto"><p>${liffId ? 'ปุ่มเริ่มโปรเจกต์จะเปิดฟอร์ม LIFF; ปุ่มอื่นแตะแล้วข้อความจะปรากฏในแชตและ backend ตอบตามหัวข้อ' : 'แตะแล้วข้อความจะปรากฏในแชตและ backend ตอบตามหัวข้อ'}; ปุ่มคุยกับทีมจะหยุดบอตทันที</p><pre>${escapeHtml(JSON.stringify(menu.areas.map((area) => area.action), null, 2))}</pre><a class="button" href="/admin">กลับหน้าหลังบ้าน</a></section>`);
 }
 
 module.exports = { buildApp, buildRichMenu, validateRichMenuImage, verifyPassword, hashToken };

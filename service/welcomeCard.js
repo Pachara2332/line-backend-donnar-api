@@ -4,7 +4,7 @@ const ACTIONS = [
   { label: 'คุยกับทีม', data: 'action=HUMAN', displayText: 'คุยกับคน', color: '#0B1E38' },
 ];
 
-function buildWelcomeCard(greeting) {
+function buildWelcomeCard(greeting, liffId = '') {
   const text = String(greeting || '').trim() || 'ยินดีต้อนรับสู่ Donnar.Tech เราช่วยวางแผนและพัฒนาซอฟต์แวร์สำหรับธุรกิจครับ';
   return {
     type: 'flex',
@@ -43,7 +43,7 @@ function buildWelcomeCard(greeting) {
           style: 'primary',
           color,
           height: 'md',
-          action: { type: 'postback', label, data, displayText },
+          action: liffId && data === 'action=START_QUALIFY' ? { type: 'uri', label, uri: `https://liff.line.me/${liffId}` } : { type: 'postback', label, data, displayText },
         })),
       },
       styles: { body: { backgroundColor: '#F7FAFE' }, footer: { backgroundColor: '#FFFFFF' } },

@@ -14,7 +14,7 @@ The welcome card uses a LINE postback action for “ปรึกษาโปร�
 ## Options considered
 
 1. **Chat-only quick replies:** Keep the intake in the conversation, add quick reply choices, and ask one question at a time. This is the smallest change and needs no LIFF setup, but it is less effective for collecting several structured details at once.
-2. **LIFF brief form:** Open a compact form inside LINE. It is clearer for structured requirements, but needs a LIFF app registered to the Messaging API channel and a new hosted form/API flow.
+2. **LIFF brief form:** Open a compact form inside LINE. It is clearer for structured requirements, but needs a LIFF app registered to a LINE Login channel in the same provider as the Messaging API channel and a new hosted form/API flow.
 3. **Hybrid LIFF form with chat confirmation (recommended):** Open a short LIFF form from the existing card. Save the structured brief to the existing lead, show a success state in LIFF, and send a confirmation message back to the LINE chat. Keep free-text chat intake and “คุยกับคน” available as alternatives.
 
 ## User flow
@@ -28,7 +28,7 @@ The welcome card uses a LINE postback action for “ปรึกษาโปร�
    - Intended users and platform (optional).
    - Desired timeline (optional).
    - Approximate budget range (optional, with “ยังไม่แน่ใจ”).
-   - Preferred next step/contact preference (optional; LINE chat is the default).
+   - Preferred next step (optional; LINE chat by default, or an online meeting arranged in chat).
 4. On submit, backend verifies the LIFF ID token with LINE, derives the LINE user ID from the verified response, and associates the brief with that user’s existing conversation and lead.
 5. The form shows a success state. The backend sends a short confirmation to the same LINE chat and tells the customer that a staff member can review the brief.
 6. Staff see the new details in the existing back office lead row and conversation history. They can take over through the existing HUMAN handoff.
@@ -36,8 +36,8 @@ The welcome card uses a LINE postback action for “ปรึกษาโปร�
 ## Architecture and interfaces
 
 - Serve a responsive, single-page form from this backend at `/liff/intake`; do not add a separate hosting service or customer account system.
-- Add `LIFF_ID` as a Render environment variable. The LIFF app is registered under the existing LINE Developers channel with the HTTPS endpoint URL and the minimum `openid` scope required to obtain an ID token.
-- Change only the welcome-card “ปรึกษาโปรเจกต์” action to a URI action that opens the LIFF URL. Keep “ดูบริการ” and “คุยกับทีม” behavior unchanged. Keep the three Rich Menu message actions unchanged.
+- Add `LIFF_ID` as a Render environment variable. The LIFF app is registered under a LINE Login channel in the same provider as the Messaging API channel, with the HTTPS endpoint URL and the minimum `openid` scope required to obtain an ID token.
+- When `LIFF_ID` is set, the welcome-card “ปรึกษาโปรเจกต์” button and the first Rich Menu area become URI actions that open the LIFF URL (the Rich Menu change takes effect only after staff republish it). Old `START_QUALIFY` postbacks and “เริ่มปรึกษาโปรเจกต์” text reply with a button that opens the form while chat intake still works. “ดูบริการ” and “คุยกับทีม” stay unchanged.
 - Add `POST /api/intake/project` accepting the raw ID token plus validated form fields. Verify the token against LINE’s ID-token verification endpoint using the expected channel ID; never accept a client-supplied LINE user ID as identity.
 - Upsert into the existing conversation and lead records. Store normalized fields in `leads.requirements_json`, mark the lead `QUALIFIED` when the required brief is saved (or preserve `HUMAN_REQUIRED` if already in HUMAN mode), and set the conversation’s current step to `complete` so the next chat message does not restart the wizard unexpectedly.
 - Record the submission in the existing message history as a concise inbound intake summary, without logging the ID token or adding a separate customer account table.
@@ -65,7 +65,7 @@ The welcome card uses a LINE postback action for “ปรึกษาโปร�
 
 ## Deployment dependencies
 
-- Register a LIFF app under the existing LINE Developers channel, set endpoint URL to `https://donnar-line-backend-api.onrender.com/liff/intake`, and enable the `openid` scope.
+- Create (or reuse) a **LINE Login channel** in the same provider as the existing Messaging API channel; LIFF apps cannot be added to a Messaging API channel. Same provider is required so the ID token `sub` equals the Messaging API user ID. Add the LIFF app there, set endpoint URL to `https://donnar-line-backend-api.onrender.com/liff/intake`, and enable the `openid` scope.
 - Add `LIFF_ID` to Render. The form can be deployed before LIFF is registered, but the card action should not switch to the LIFF URI until the LIFF ID and endpoint are configured.
 - Verify the webhook and send a test brief from a LINE test account before treating the intake as live.
 
