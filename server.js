@@ -30,7 +30,10 @@ async function main() {
     process.on('SIGTERM', shutdown);
     process.on('SIGINT', shutdown);
   } catch (error) {
-    console.error('backend startup failed', { name: error.name });
+    const diagnostic = { name: error.name };
+    if (typeof error.code === 'string' && /^[A-Z0-9_]+$/i.test(error.code)) diagnostic.code = error.code;
+    if (typeof error.syscall === 'string' && /^[a-z0-9_]+$/i.test(error.syscall)) diagnostic.syscall = error.syscall;
+    console.error('backend startup failed', diagnostic);
     await db.end().catch(() => {});
     process.exitCode = 1;
   }
