@@ -4,6 +4,8 @@ const rateLimit = require('express-rate-limit');
 const { randomBytes, createHash, scryptSync, timingSafeEqual } = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { Writable } = require('node:stream');
+const { formidable } = require('formidable');
 const { createLineSignatureMiddleware } = require('./middleware/webhookValidation');
 const { createConversationService } = require('./service/conversationService');
 const { DEFAULT_COPY } = require('./service/messageCatalog');
@@ -79,6 +81,39 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
   });
 
   app.use('/admin', express.urlencoded({ extended: false, limit: '20kb' }), requireStaff(db, config));
+  const richMenuUploadLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
+  app.post('/admin/rich-menu/draft', richMenuUploadLimit, parseRichMenuUpload, requireCsrf, async (req, res, next) => {
+    try {
+      const image = req.uploadImage;
+      const contentType = req.uploadContentType;
+      if (!image || !validateRichMenuImage(image, contentType)) {
+        return res.status(400).type('text').send('เลือกรูป JPEG หรือ PNG ขนาด 2500 × 1686 และไม่เกิน 1 MB');
+      }
+      await withTransaction(db, async (client) => {
+        await client.query("DELETE FROM rich_menu_publications WHERE status = 'DRAFT'");
+        await client.query("INSERT INTO rich_menu_publications(status, image_data, image_content_type) VALUES ('DRAFT', $1, $2)", [image, contentType]);
+      });
+      return res.redirect(303, '/admin#rich-menu');
+    } catch (error) {
+      if (error.code === '23505') return res.status(409).type('text').send('มี draft Rich Menu ถูกแก้ไขพร้อมกัน กรุณาลองอัปโหลดอีกครั้ง');
+      return next(error);
+    }
+  });
+  app.get('/admin/rich-menu/image/:id', async (req, res, next) => {
+    try {
+      const { rows } = await db.query('SELECT status, image_data, image_content_type FROM rich_menu_publications WHERE id = $1 AND image_data IS NOT NULL', [Number(req.params.id)]);
+      if (!rows[0] || !['DRAFT', 'PUBLISHED'].includes(rows[0].status) || !['image/jpeg', 'image/png'].includes(rows[0].image_content_type)) return res.sendStatus(404);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'no-store');
+      return res.type(rows[0].image_content_type).send(rows[0].image_data);
+    } catch (error) { return next(error); }
+  });
+  app.post('/admin/rich-menu/draft/:id/cancel', requireCsrf, async (req, res, next) => {
+    try {
+      await db.query("DELETE FROM rich_menu_publications WHERE id = $1 AND status = 'DRAFT'", [Number(req.params.id)]);
+      return res.redirect(303, '/admin#rich-menu');
+    } catch (error) { return next(error); }
+  });
   app.get('/admin', async (req, res, next) => {
     try { return res.type('html').send(await adminPage(db, req.staff, req.csrfToken, req.query)); } catch (error) { return next(error); }
   });
@@ -249,6 +284,30 @@ function requireCsrf(req, res, next) {
   next();
 }
 
+function parseRichMenuUpload(req, res, next) {
+  const chunks = [];
+  const form = formidable({
+    maxFiles: 1,
+    maxFields: 1,
+    maxFieldsSize: 2048,
+    maxFileSize: 1024 * 1024,
+    maxTotalFileSize: 1024 * 1024,
+    allowEmptyFiles: false,
+    fileWriteStreamHandler: () => new Writable({ write(chunk, encoding, callback) { chunks.push(Buffer.from(chunk)); callback(); } }),
+  });
+  form.parse(req, (error, fields, files) => {
+    if (error) return res.status(400).type('text').send('ไฟล์รูปไม่ถูกต้อง หรือมีขนาดเกิน 1 MB');
+    const images = files.image;
+    if (Object.keys(files).length !== 1 || !images || (Array.isArray(images) && images.length !== 1)) return res.status(400).type('text').send('กรุณาเลือกไฟล์ภาพ Rich Menu หนึ่งไฟล์');
+    const imageFile = Array.isArray(images) ? images[0] : images;
+    const fieldValues = Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, Array.isArray(value) ? value[0] : value]));
+    req.body = fieldValues;
+    req.uploadImage = Buffer.concat(chunks);
+    req.uploadContentType = imageFile.mimetype;
+    return next();
+  });
+}
+
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 }
@@ -359,12 +418,12 @@ function formatAdminDateTime(value) {
   return new Intl.DateTimeFormat('th-TH', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Bangkok' }).format(date);
 }
 
-function validateRichMenuImage(image) {
+function validateRichMenuImage(image, declaredContentType) {
   if (!Buffer.isBuffer(image) || image.length < 24 || image.length > 1024 * 1024) return false;
   const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  if (image.subarray(0, 8).equals(pngSignature)) return image.readUInt32BE(16) === 2500 && image.readUInt32BE(20) === 1686;
+  if (image.subarray(0, 8).equals(pngSignature)) return image.length >= 33 && image.toString('ascii', 12, 16) === 'IHDR' && (!declaredContentType || declaredContentType === 'image/png') && image.readUInt32BE(16) === 2500 && image.readUInt32BE(20) === 1686;
   const dimensions = readJpegDimensions(image);
-  return dimensions?.width === 2500 && dimensions?.height === 1686;
+  return image[0] === 0xff && image[1] === 0xd8 && image[image.length - 2] === 0xff && image[image.length - 1] === 0xd9 && (!declaredContentType || declaredContentType === 'image/jpeg') && dimensions?.width === 2500 && dimensions?.height === 1686;
 }
 
 function richMenuImageContentType(image) {
