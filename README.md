@@ -57,6 +57,7 @@ Production startup requires `DATABASE_URL`, `LINE_CHANNEL_SECRET`, `LINE_CHANNEL
 - The Thai greeting and deterministic prompts collect service type, project summary, optional budget, and contact preference.
 - “คุยกับคน” and the third Rich Menu action switch the conversation to `HUMAN`, send one acknowledgement, and stop bot replies. Staff can inspect the lead, reply, and return the conversation to `BOT`.
 - The staff console uses scrypt login, HTTP-only sessions, CSRF checks, editable copy, audit records, and the Donnar.Tech logo.
+- The CRM inbox includes unread new-lead alerts and a “รอตอบ” queue. A lead alert is created once with the first lead row; conversations leave the queue only after a later LINE outbound message is recorded as `SENT`.
 - LINE display names and profile photos are fetched after webhook processing, cached for up to 24 hours, and shown in the CRM when available. Profile lookup failures do not block replies; unavailable profiles fall back to the LINE UID.
 - In `/admin`, staff can upload and preview a Rich Menu draft. Images must be JPEG or PNG, exactly 2500 × 1686 pixels, and at most 1 MB. The validated image is stored in PostgreSQL; invalid uploads leave the current draft and live menu unchanged.
 - Upload and preview do not change the LINE OA. Staff must separately confirm `ยืนยันเปลี่ยน Rich Menu` to create the menu, upload the chosen bytes, and set it as default. The previous local publication is retained in history, while its stored image bytes are cleared after a successful switch.

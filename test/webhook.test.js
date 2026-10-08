@@ -85,6 +85,9 @@ test('processes a follow once and sends the service-picker card on a redelivery-
   assert.equal(second.status, 200);
   assert.equal(await count(db, 'webhook_events'), 1);
   assert.equal(await count(db, 'leads'), 1);
+  assert.equal(await count(db, 'staff_notifications'), 1);
+  const notification = await db.query("SELECT type, read_at FROM staff_notifications WHERE conversation_id = 1");
+  assert.deepEqual(notification.rows[0], { type: 'new_lead', read_at: null });
   assert.equal(sent.length, 1);
   assert.equal(sent[0].messages[0].type, 'flex');
   assert.match(sent[0].messages[0].altText, /ยินดีต้อนรับสู่ Donnar\.Tech/);
@@ -130,7 +133,7 @@ test('stores a lead and advances the deterministic intake prompt on text', async
   assert.equal(response.status, 200);
   assert.equal(await count(db, 'leads'), 1);
   assert.equal(await count(db, 'messages'), 2);
-  assert.match(sent[0].messages[0].text, /ระบบนี้อยากช่วยแก้ปัญหาอะไร/);
+  assert.match(sent[0].messages[0].text, /อยากให้โปรเจกต์นี้ช่วยแก้ปัญหาอะไร/);
   await close();
 });
 

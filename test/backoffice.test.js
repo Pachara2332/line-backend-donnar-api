@@ -49,6 +49,55 @@ test('requires a staff session and CSRF token for back-office changes', async (t
   assert.equal((await db.query('SELECT mode FROM conversations WHERE id = 1')).rows[0].mode, 'HUMAN');
 });
 
+test('marks a new-lead notification read only through authenticated CSRF-protected requests', async (t) => {
+  const { db, app, close } = await setup();
+  t.after(close);
+  await db.query("INSERT INTO line_users(line_user_id) VALUES ('U-notification-route')");
+  await db.query("INSERT INTO conversations(line_user_id) VALUES ('U-notification-route')");
+  await db.query('INSERT INTO leads(conversation_id) VALUES (1)');
+  await db.query("INSERT INTO staff_notifications(type, conversation_id) VALUES ('new_lead', 1)");
+
+  assert.equal((await request(app).post('/admin/notifications/1/read').type('form').send({ _csrf: 'x' })).status, 303);
+  const { cookie, csrf } = await login(app);
+  const rejected = await request(app).post('/admin/notifications/1/read').set('cookie', cookie).type('form').send({ _csrf: 'wrong' });
+  assert.equal(rejected.status, 403);
+  const read = await request(app).post('/admin/notifications/1/read').set('cookie', cookie).type('form').send({ _csrf: csrf });
+  assert.equal(read.status, 303);
+  assert.equal(read.headers.location, '/admin?conversation=1#inbox');
+  const { rows } = await db.query('SELECT read_at FROM staff_notifications WHERE id = 1');
+  const readAt = rows[0].read_at;
+  assert.ok(readAt);
+  assert.equal((await request(app).post('/admin/notifications/1/read').set('cookie', cookie).type('form').send({ _csrf: csrf })).status, 303);
+  assert.equal((await db.query('SELECT read_at FROM staff_notifications WHERE id = 1')).rows[0].read_at.toISOString(), readAt.toISOString());
+});
+
+test('shows unread lead alerts and only conversations whose latest customer message has no later SENT reply', async (t) => {
+  const { db, app, close } = await setup();
+  t.after(close);
+  await db.query("INSERT INTO line_users(line_user_id, display_name) VALUES ('U-waiting', '<Alice>'), ('U-resolved', 'Bob'), ('U-waiting-later', 'Carol')");
+  await db.query("INSERT INTO conversations(line_user_id) VALUES ('U-waiting'), ('U-resolved'), ('U-waiting-later')");
+  await db.query('INSERT INTO leads(conversation_id) VALUES (1), (2), (3)');
+  await db.query("INSERT INTO staff_notifications(type, conversation_id) VALUES ('new_lead', 1)");
+  await db.query("INSERT INTO messages(conversation_id, direction, message_type, body, created_at) VALUES (1, 'IN', 'text', '<script>alert(1)</script>', '2026-10-09T10:00:00Z')");
+  await db.query("INSERT INTO messages(conversation_id, direction, message_type, body, send_status, created_at) VALUES (1, 'OUT', 'text', '{\"text\":\"failed\"}', 'UNKNOWN', '2026-10-09T11:00:00Z')");
+  await db.query("INSERT INTO messages(conversation_id, direction, message_type, body, created_at) VALUES (2, 'IN', 'text', 'ขอบริการ', '2026-10-09T10:00:00Z')");
+  await db.query("INSERT INTO messages(conversation_id, direction, message_type, body, send_status, created_at) VALUES (2, 'OUT', 'text', '{\"text\":\"ตอบแล้ว\"}', 'SENT', '2026-10-09T10:00:00Z')");
+  await db.query("INSERT INTO messages(conversation_id, direction, message_type, body, created_at) VALUES (3, 'IN', 'text', 'ข้อความที่มาทีหลัง', '2026-10-09T12:00:00Z')");
+
+  const { cookie, page } = await login(app);
+  assert.equal(page.status, 200);
+  assert.match(page.text, /Lead ใหม่/);
+  assert.match(page.text, /รอตอบ/);
+  const waitingPanel = page.text.match(/id="waiting-replies">([\s\S]*?)<\/article><\/section>/)?.[1] || '';
+  assert.match(waitingPanel, /&lt;Alice&gt;/);
+  assert.match(waitingPanel, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(waitingPanel, /<script>alert\(1\)<\/script>/);
+  assert.match(waitingPanel, /&lt;Alice&gt;/);
+  assert.doesNotMatch(waitingPanel, /U-resolved/);
+  assert.ok(waitingPanel.indexOf('&lt;Alice&gt;') < waitingPanel.indexOf('Carol'));
+  assert.ok(cookie);
+});
+
 test('publishes message copy revisions with an audit entry and escapes edited text in the console', async (t) => {
   const { db, app, close } = await setup();
   t.after(close);
