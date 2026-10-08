@@ -49,6 +49,17 @@ test('creates three full-width stacked actions at the same coordinates as the im
   assert.equal(Object.hasOwn(menu, 'baseUrl'), false);
 });
 
+test('shows the tall branded image in the staff preview', async (t) => {
+  const { app, cookie, csrf } = await setup(t);
+  const response = await request(app).post('/admin/rich-menu/preview').set('cookie', cookie).type('form').send({ _csrf: csrf });
+  assert.equal(response.status, 200);
+  assert.match(response.text, /\/assets\/line-rich-menu-2500x1686\.png/);
+  const image = await request(app).get('/assets/line-rich-menu-2500x1686.png');
+  assert.equal(image.status, 200);
+  assert.equal(image.body.readUInt32BE(16), 2500);
+  assert.equal(image.body.readUInt32BE(20), 1686);
+});
+
 test('publishes through the fake adapter and requires explicit confirmation to replace a published menu', async (t) => {
   const { db, lineClient, app, publish, cookie, csrf } = await setup(t);
   assert.equal((await publish()).status, 303);
