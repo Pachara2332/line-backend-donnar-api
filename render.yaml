@@ -22,3 +22,5 @@ services:
         sync: false
       - key: STAFF_PASSWORD_HASH
         sync: false
+      - key: LIFF_ID
+        sync: false

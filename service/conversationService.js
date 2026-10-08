@@ -14,7 +14,7 @@ function eventId(event) {
   return event.webhookEventId || createHash('sha256').update(JSON.stringify(event)).digest('hex');
 }
 
-function createConversationService({ db, lineClient }) {
+function createConversationService({ db, lineClient, liffId = '' }) {
   const conversationLocks = new Map();
 
   async function withConversationLock(conversationId, operation) {
@@ -59,6 +59,11 @@ function createConversationService({ db, lineClient }) {
     });
   }
 
+  function startQualifyMessage(serviceTypeCopy) {
+    if (!liffId) return { type: 'text', text: serviceTypeCopy };
+    return { type: 'template', altText: 'กรอกรายละเอียดโปรเจกต์', template: { type: 'buttons', text: 'กดปุ่มเพื่อกรอกรายละเอียดโปรเจกต์ หรือพิมพ์ประเภทงานที่สนใจตอบในแชตได้เลยครับ', actions: [{ type: 'uri', label: 'เปิดฟอร์มปรึกษาโปรเจกต์', uri: `https://liff.line.me/${liffId}` }] } };
+  }
+
   async function processEventState(client, event, id) {
     if (!event || typeof event.type !== 'string' || !['follow', 'message', 'postback', 'unfollow'].includes(event.type)) return { ignored: true };
     const userId = event.source?.userId;
@@ -80,7 +85,7 @@ function createConversationService({ db, lineClient }) {
     }
 
     if (event.type === 'follow') {
-      await queueMessage(buildWelcomeCard(await getCopy(client, 'greeting')));
+      await queueMessage(buildWelcomeCard(await getCopy(client, 'greeting'), liffId));
       return { processed: true };
     }
     if (event.type === 'unfollow') return { processed: true };
@@ -111,7 +116,7 @@ function createConversationService({ db, lineClient }) {
       if (action === 'START_QUALIFY') {
         await client.query("UPDATE conversations SET current_step = 'serviceType', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
         await client.query("UPDATE leads SET requirements_json = '{}'::jsonb, status = 'QUALIFYING', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1", [conversation.id]);
-        await queueReply(await getCopy(client, 'serviceType'));
+        await queueMessage(startQualifyMessage(await getCopy(client, 'serviceType')));
       } else if (action === 'SERVICES') await queueReply(await getCopy(client, 'services'));
       else if (action === 'WORKFLOW') await queueReply(await getCopy(client, 'workflow'));
       else if (action === 'PORTFOLIO') await queueReply(await getCopy(client, 'portfolio'));
@@ -125,7 +130,7 @@ function createConversationService({ db, lineClient }) {
     if (/^(เริ่มปรึกษาโปรเจกต์|ปรึกษาโปรเจกต์)$/i.test(text)) {
       await client.query("UPDATE conversations SET current_step = 'serviceType', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
       await client.query("UPDATE leads SET requirements_json = '{}'::jsonb, status = 'QUALIFYING', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1", [conversation.id]);
-      await queueReply(await getCopy(client, 'serviceType'));
+      await queueMessage(startQualifyMessage(await getCopy(client, 'serviceType')));
       return { processed: true };
     }
     if (/^(ขอดูบริการ|บริการของเรา|services)$/i.test(text)) {
@@ -182,7 +187,35 @@ function createConversationService({ db, lineClient }) {
     }));
   }
 
-  return { processEvent, setMode };
+  async function submitIntake(userId, submissionId, brief, summary) {
+    const id = `liff:${submissionId}`;
+    const saved = await withTransaction(db, async (client) => {
+      const dedupe = await client.query('INSERT INTO webhook_events(event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING RETURNING event_id', [id, 'liff_intake']);
+      if (!dedupe.rowCount) return false;
+      await client.query('INSERT INTO line_users(line_user_id) VALUES ($1) ON CONFLICT (line_user_id) DO NOTHING', [userId]);
+      await client.query('INSERT INTO conversations(line_user_id) VALUES ($1) ON CONFLICT (line_user_id) DO NOTHING', [userId]);
+      const { rows } = await client.query('SELECT * FROM conversations WHERE line_user_id = $1', [userId]);
+      const conversation = rows[0];
+      await client.query("INSERT INTO leads(conversation_id, source) VALUES ($1, 'liff') ON CONFLICT (conversation_id) DO NOTHING", [conversation.id]);
+      await client.query("UPDATE leads SET requirements_json = $1::jsonb, status = CASE WHEN status = 'HUMAN_REQUIRED' THEN status ELSE 'QUALIFIED' END, updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $2", [JSON.stringify(brief), conversation.id]);
+      await client.query("UPDATE conversations SET current_step = 'complete', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
+      await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id) VALUES ($1, 'IN', 'liff_intake', $2, $3)", [conversation.id, summary, id]);
+      const text = conversation.mode === 'HUMAN'
+        ? 'ได้รับรายละเอียดโปรเจกต์แล้วครับ ทีม Donnar.Tech มีข้อมูลนี้แล้วและจะตอบในแชตนี้'
+        : 'ได้รับรายละเอียดโปรเจกต์แล้วครับ ทีม Donnar.Tech จะตรวจสอบและติดต่อกลับในแชตนี้ หากต้องการคุยกับทีมทันที พิมพ์ “คุยกับคน” ได้เลยครับ';
+      await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id, send_status, allow_human_mode) VALUES ($1, 'OUT', 'text', $2, $3, 'PENDING', TRUE)", [conversation.id, JSON.stringify({ type: 'text', text }), id]);
+      return true;
+    });
+    try {
+      await deliverPending(id, userId);
+      const { rows } = await db.query("SELECT send_status FROM messages WHERE event_id = $1 AND direction = 'OUT'", [id]);
+      return { duplicate: !saved, confirmationSent: rows[0]?.send_status === 'SENT' };
+    } catch {
+      return { duplicate: !saved, confirmationSent: false };
+    }
+  }
+
+  return { processEvent, setMode, submitIntake };
 }
 
 module.exports = { createConversationService, isHandoffText, eventId, QUESTIONS };
