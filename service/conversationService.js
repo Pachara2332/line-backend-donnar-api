@@ -23,23 +23,33 @@ function createConversationService({ db, lineClient, liffId = '' }) {
     if (profileRefreshes.has(userId)) return profileRefreshes.get(userId);
     const refresh = (async () => {
       try {
-        const { rows } = await db.query('SELECT profile_synced_at FROM line_users WHERE line_user_id = $1', [userId]);
+        const { rows } = await db.query('SELECT profile_synced_at, picture_url FROM line_users WHERE line_user_id = $1', [userId]);
         const lastSync = rows[0]?.profile_synced_at ? new Date(rows[0].profile_synced_at).getTime() : 0;
-        if (!rows[0] || (!force && lastSync && Date.now() - lastSync < 24 * 60 * 60 * 1000)) return;
+        if (!rows[0]) return 'missing';
+        if (!force && lastSync && Date.now() - lastSync < 24 * 60 * 60 * 1000) return rows[0].picture_url ? 'cached' : 'unavailable';
         const profile = await lineClient.getProfile(userId);
         if (profile === null) {
           await db.query('UPDATE line_users SET profile_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE line_user_id = $1', [userId]);
-          return;
+          return 'unavailable';
         }
-        if (typeof profile?.displayName !== 'string' || !profile.displayName.trim()) return;
-        await db.query('UPDATE line_users SET display_name = $1, picture_url = $2, profile_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE line_user_id = $3', [profile.displayName, typeof profile.pictureUrl === 'string' ? profile.pictureUrl : null, userId]);
-      } catch {
+        if (typeof profile?.displayName !== 'string' || !profile.displayName.trim()) return 'failed';
+        await db.query('UPDATE line_users SET display_name = $1, picture_url = COALESCE($2, picture_url), profile_synced_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE line_user_id = $3', [profile.displayName, typeof profile.pictureUrl === 'string' ? profile.pictureUrl : null, userId]);
+        return typeof profile.pictureUrl === 'string' && profile.pictureUrl ? 'updated' : 'unavailable';
+      } catch (error) {
         // Profile lookup is optional CRM metadata and must not affect messaging.
+        console.warn('LINE profile lookup failed', { status: Number.isInteger(error.status) ? error.status : null });
+        return 'failed';
       }
     })();
     profileRefreshes.set(userId, refresh);
-    try { await refresh; }
+    try { return await refresh; }
     finally { if (profileRefreshes.get(userId) === refresh) profileRefreshes.delete(userId); }
+  }
+
+  async function refreshProfileForConversation(conversationId, options = {}) {
+    const { rows } = await db.query('SELECT line_user_id FROM conversations WHERE id = $1', [conversationId]);
+    if (!rows[0]) return 'missing';
+    return refreshLineProfile(rows[0].line_user_id, options);
   }
 
   async function withConversationLock(conversationId, operation) {
@@ -243,7 +253,7 @@ function createConversationService({ db, lineClient, liffId = '' }) {
     }
   }
 
-  return { processEvent, setMode, submitIntake };
+  return { processEvent, setMode, submitIntake, refreshProfileForConversation };
 }
 
 module.exports = { createConversationService, isHandoffText, eventId, QUESTIONS };
