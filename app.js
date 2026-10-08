@@ -137,7 +137,7 @@ function buildApp({ db, lineClient, config }) {
       const creating = creatingRows[0];
       if (creating) return res.status(409).send('มีการเผยแพร่ Rich Menu กำลังดำเนินการอยู่');
       const image = fs.readFileSync(config.richMenuImagePath);
-      if (!validateRichMenuImage(image)) return res.status(400).send('ไฟล์ Rich Menu ต้องเป็น PNG ขนาด 1200 × 405 และไม่เกิน 1 MB');
+      if (!validateRichMenuImage(image)) return res.status(400).send('ไฟล์ Rich Menu ต้องเป็น PNG ขนาด 2500 × 1686 และไม่เกิน 1 MB');
       const { rows: failedRows } = await db.query("SELECT id, line_menu_id, image_uploaded FROM rich_menu_publications WHERE status = 'FAILED' ORDER BY id DESC LIMIT 1");
       const failed = failedRows[0];
       if (failed && !failed.line_menu_id) return res.status(409).send('ผลการสร้างเมนูครั้งก่อนยังไม่แน่ชัด กรุณาตรวจ Rich Menu ใน LINE ก่อนเริ่มใหม่');
@@ -276,25 +276,25 @@ async function adminPage(db, staff, csrfToken) {
 }
 
 function readMessage(body) {
-  try { const parsed = JSON.parse(body); return parsed.text || body; } catch { return body; }
+  try { const parsed = JSON.parse(body); return parsed.text || parsed.altText || (parsed.type === 'flex' ? 'การ์ดต้อนรับ' : body); } catch { return body; }
 }
 
 function validateRichMenuImage(image) {
   if (!Buffer.isBuffer(image) || image.length < 24 || image.length > 1024 * 1024) return false;
   const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  return image.subarray(0, 8).equals(pngSignature) && image.readUInt32BE(16) === 1200 && image.readUInt32BE(20) === 405;
+  return image.subarray(0, 8).equals(pngSignature) && image.readUInt32BE(16) === 2500 && image.readUInt32BE(20) === 1686;
 }
 
 function buildRichMenu() {
-  return { size: { width: 1200, height: 405 }, selected: true, name: 'Donnar Tech main menu', chatBarText: 'เมนู', areas: [
-    { bounds: { x: 0, y: 0, width: 400, height: 405 }, action: { type: 'postback', label: 'ปรึกษาโปรเจกต์', data: 'action=START_QUALIFY', displayText: 'อยากปรึกษาโปรเจกต์' } },
-    { bounds: { x: 400, y: 0, width: 400, height: 405 }, action: { type: 'postback', label: 'บริการของเรา', data: 'action=SERVICES', displayText: 'ขอดูบริการ' } },
-    { bounds: { x: 800, y: 0, width: 400, height: 405 }, action: { type: 'postback', label: 'คุยกับทีม', data: 'action=HUMAN', displayText: 'คุยกับคน' } },
+  return { size: { width: 2500, height: 1686 }, selected: true, name: 'Donnar Tech main menu', chatBarText: 'เมนู', areas: [
+    { bounds: { x: 0, y: 0, width: 2500, height: 562 }, action: { type: 'postback', label: 'ปรึกษาโปรเจกต์', data: 'action=START_QUALIFY', displayText: 'อยากปรึกษาโปรเจกต์' } },
+    { bounds: { x: 0, y: 562, width: 2500, height: 562 }, action: { type: 'postback', label: 'บริการของเรา', data: 'action=SERVICES', displayText: 'ขอดูบริการ' } },
+    { bounds: { x: 0, y: 1124, width: 2500, height: 562 }, action: { type: 'postback', label: 'คุยกับทีม', data: 'action=HUMAN', displayText: 'คุยกับคน' } },
   ] };
 }
 
 function menuPreview(baseUrl) {
-  const image = '/assets/line-rich-menu-1200x405.png';
+  const image = '/assets/line-rich-menu-2500x1686.png';
   const menu = buildRichMenu();
   return shell('Rich Menu preview', `<section class="card"><h1>ตัวอย่าง Rich Menu</h1><p>สามปุ่ม: ปรึกษาโปรเจกต์, บริการของเรา, คุยกับทีม</p><img src="${image}" alt="Donnar.Tech Rich Menu" style="width:100%;height:auto"><p>การกดเมนูจริงจะส่ง postback ไปที่ backend; ปุ่มคุยกับทีมจะหยุดบอตทันที</p><pre>${escapeHtml(JSON.stringify(menu.areas.map((area) => area.action), null, 2))}</pre><a class="button" href="/admin">กลับหน้าหลังบ้าน</a></section>`);
 }

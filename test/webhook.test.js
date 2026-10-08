@@ -72,7 +72,7 @@ test('rejects malformed postbacks before processing earlier events', async () =>
   await close();
 });
 
-test('processes a follow once and ignores a redelivered event', async () => {
+test('processes a follow once and sends the service-picker card on a redelivery-safe path', async () => {
   const { app, db, sent, close } = await setup();
   const event = { type: 'follow', replyToken: 'reply-1', source: { type: 'user', userId: 'U1' }, timestamp: 1760000000000, webhookEventId: 'evt-1' };
   const rawBody = Buffer.from(JSON.stringify({ events: [event] }));
@@ -86,7 +86,10 @@ test('processes a follow once and ignores a redelivered event', async () => {
   assert.equal(await count(db, 'webhook_events'), 1);
   assert.equal(await count(db, 'leads'), 1);
   assert.equal(sent.length, 1);
-  assert.equal(sent[0].messages[0].text.includes('Donnar.Tech'), true);
+  assert.equal(sent[0].messages[0].type, 'flex');
+  assert.match(sent[0].messages[0].altText, /ยินดีต้อนรับสู่ Donnar\.Tech/);
+  assert.equal(sent[0].messages[0].contents.type, 'bubble');
+  assert.deepEqual(sent[0].messages[0].contents.footer.contents.map((button) => new URLSearchParams(button.action.data).get('action')), ['START_QUALIFY', 'SERVICES', 'HUMAN']);
   await close();
 });
 

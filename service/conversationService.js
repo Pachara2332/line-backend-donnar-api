@@ -1,5 +1,6 @@
 const { createHash } = require('node:crypto');
 const { getCopy } = require('./messageCatalog');
+const { buildWelcomeCard } = require('./welcomeCard');
 const { withTransaction } = require('../database');
 
 const QUESTIONS = ['serviceType', 'projectSummary', 'budgetRange', 'contactPreference'];
@@ -68,15 +69,18 @@ function createConversationService({ db, lineClient }) {
     const conversation = conversations[0];
     await client.query('INSERT INTO leads(conversation_id, source) VALUES ($1, NULL) ON CONFLICT (conversation_id) DO NOTHING', [conversation.id]);
 
-    async function queueReply(text, allowHumanMode = false) {
-      if (!text) return;
-      const message = { type: 'text', text };
+    async function queueMessage(message, allowHumanMode = false) {
+      if (!message) return;
       await client.query(`INSERT INTO messages(conversation_id, direction, message_type, body, event_id, reply_token, send_status, allow_human_mode)
-        VALUES ($1, 'OUT', 'text', $2, $3, $4, 'PENDING', $5) ON CONFLICT (event_id, direction) DO NOTHING`, [conversation.id, JSON.stringify(message), id, event.replyToken || null, allowHumanMode]);
+        VALUES ($1, 'OUT', $2, $3, $4, $5, 'PENDING', $6) ON CONFLICT (event_id, direction) DO NOTHING`, [conversation.id, message.type, JSON.stringify(message), id, event.replyToken || null, allowHumanMode]);
+    }
+
+    async function queueReply(text, allowHumanMode = false) {
+      if (text) await queueMessage({ type: 'text', text }, allowHumanMode);
     }
 
     if (event.type === 'follow') {
-      await queueReply(await getCopy(client, 'greeting'));
+      await queueMessage(buildWelcomeCard(await getCopy(client, 'greeting')));
       return { processed: true };
     }
     if (event.type === 'unfollow') return { processed: true };

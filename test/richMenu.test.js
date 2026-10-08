@@ -7,7 +7,7 @@ const { buildRichMenu, validateRichMenuImage, buildApp } = require('../app');
 const { createTestDatabase } = require('./helpers/database');
 const { FakeLineMessagingClient } = require('../service/lineMessagingClient');
 
-const assetPath = path.join(__dirname, '..', 'assets/line-rich-menu-1200x405.png');
+const assetPath = path.join(__dirname, '..', 'assets/line-rich-menu-2500x1686.png');
 const config = { lineChannelSecret: 'secret', lineAccessToken: '', fakeLineMode: true, staffUsername: 'operator', publicBaseUrl: 'http://localhost', richMenuImagePath: assetPath };
 
 async function setup(t) {
@@ -27,15 +27,24 @@ async function setup(t) {
   return { db, lineClient, app, cookie, csrf, publish };
 }
 
-test('accepts only a valid 1200 by 405 PNG image no larger than LINE allows', () => {
+test('accepts only the taller 2500 by 1686 PNG image within LINE limits', () => {
   const image = fs.readFileSync(assetPath);
   assert.equal(validateRichMenuImage(image), true);
+  assert.equal(image.readUInt32BE(16), 2500);
+  assert.equal(image.readUInt32BE(20), 1686);
+  assert.ok(image.length <= 1024 * 1024);
   assert.equal(validateRichMenuImage(Buffer.from('not a png')), false);
 });
 
-test('creates exactly three real actions and does not send local-only fields to LINE', () => {
+test('creates three full-width stacked actions at the same coordinates as the image', () => {
   const menu = buildRichMenu();
+  assert.deepEqual(menu.size, { width: 2500, height: 1686 });
   assert.equal(menu.areas.length, 3);
+  assert.deepEqual(menu.areas.map(({ bounds }) => [bounds.x, bounds.y, bounds.width, bounds.height]), [
+    [0, 0, 2500, 562],
+    [0, 562, 2500, 562],
+    [0, 1124, 2500, 562],
+  ]);
   assert.deepEqual(menu.areas.map((area) => new URLSearchParams(area.action.data).get('action')), ['START_QUALIFY', 'SERVICES', 'HUMAN']);
   assert.equal(Object.hasOwn(menu, 'baseUrl'), false);
 });

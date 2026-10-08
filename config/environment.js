@@ -26,7 +26,7 @@ function loadConfig(env = process.env) {
     staffPasswordHash: env.STAFF_PASSWORD_HASH || '',
     fakeLineMode: env.LINE_FAKE_MODE === 'true' && nodeEnv !== 'production',
     publicBaseUrl: env.PUBLIC_BASE_URL || 'http://localhost:3000',
-    richMenuImagePath: env.RICH_MENU_IMAGE_PATH || pathFromRepo('assets/line-rich-menu-1200x405.png'),
+    richMenuImagePath: env.RICH_MENU_IMAGE_PATH || pathFromRepo('assets/line-rich-menu-2500x1686.png'),
   };
 }
 

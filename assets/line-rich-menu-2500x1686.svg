@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2500" height="1686" viewBox="0 0 2500 1686">
+  <defs>
+    <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#09162A"/>
+      <stop offset="1" stop-color="#0D2340"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#10213B"/>
+      <stop offset="0.66" stop-color="#142C4D"/>
+      <stop offset="1" stop-color="#123B69"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1269FF"/>
+      <stop offset="1" stop-color="#18B8F4"/>
+    </linearGradient>
+    <linearGradient id="mint" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#58E3C1"/>
+      <stop offset="1" stop-color="#15B5D7"/>
+    </linearGradient>
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#1687FF" stop-opacity="0.46"/>
+      <stop offset="1" stop-color="#1687FF" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="34"/>
+    </filter>
+  </defs>
+  <rect width="2500" height="1686" fill="url(#canvas)"/>
+  <g font-family="Thonburi, 'Noto Sans Thai', Tahoma, sans-serif">
+    <g transform="translate(0 0)">
+      <rect x="54" y="40" width="2392" height="516" rx="38" fill="url(#panel)" stroke="#29496F" stroke-width="3"/>
+      <rect x="54" y="40" width="18" height="516" rx="9" fill="url(#mint)"/>
+      <circle cx="2200" cy="298" r="250" fill="url(#glow)" filter="url(#soft)"/>
+      <circle cx="2200" cy="298" r="152" fill="none" stroke="#2F8FFF" stroke-opacity="0.32" stroke-width="3"/>
+      <circle cx="2200" cy="298" r="112" fill="#0B1E38" stroke="#45D8D4" stroke-opacity="0.76" stroke-width="5"/>
+      <path d="M2164 298h68m-28-28 28 28-28 28" fill="none" stroke="#61E4C3" stroke-linecap="round" stroke-linejoin="round" stroke-width="12"/>
+      <text x="146" y="174" fill="#59E2C0" font-size="48" font-weight="700" letter-spacing="6">01  /  START</text>
+      <text x="146" y="310" fill="#F4F8FF" font-size="106" font-weight="700">ปรึกษาโปรเจกต์</text>
+      <text x="150" y="400" fill="#B7C9DC" font-size="48">บอกโจทย์ของคุณ แล้วให้ทีมช่วยวางแผน</text>
+      <rect x="150" y="458" width="340" height="7" rx="4" fill="url(#mint)"/>
+    </g>
+    <g transform="translate(0 556)">
+      <rect x="54" y="40" width="2392" height="516" rx="38" fill="url(#panel)" stroke="#29496F" stroke-width="3"/>
+      <rect x="54" y="40" width="18" height="516" rx="9" fill="url(#blue)"/>
+      <circle cx="2200" cy="298" r="250" fill="url(#glow)" filter="url(#soft)"/>
+      <circle cx="2200" cy="298" r="152" fill="none" stroke="#2F8FFF" stroke-opacity="0.32" stroke-width="3"/>
+      <circle cx="2200" cy="298" r="112" fill="#0B1E38" stroke="#168BFF" stroke-opacity="0.88" stroke-width="5"/>
+      <path d="M2164 298h68m-28-28 28 28-28 28" fill="none" stroke="#31B9FF" stroke-linecap="round" stroke-linejoin="round" stroke-width="12"/>
+      <text x="146" y="174" fill="#50C8FF" font-size="48" font-weight="700" letter-spacing="6">02  /  SERVICES</text>
+      <text x="146" y="310" fill="#F4F8FF" font-size="106" font-weight="700">บริการของเรา</text>
+      <text x="150" y="400" fill="#B7C9DC" font-size="48">เว็บไซต์ • เว็บแอป • โมบายแอป • ระบบภายใน • AI</text>
+      <rect x="150" y="458" width="340" height="7" rx="4" fill="url(#blue)"/>
+    </g>
+    <g transform="translate(0 1112)">
+      <rect x="54" y="40" width="2392" height="516" rx="38" fill="url(#panel)" stroke="#29496F" stroke-width="3"/>
+      <rect x="54" y="40" width="18" height="516" rx="9" fill="url(#mint)"/>
+      <circle cx="2200" cy="298" r="250" fill="url(#glow)" filter="url(#soft)"/>
+      <circle cx="2200" cy="298" r="152" fill="none" stroke="#2F8FFF" stroke-opacity="0.32" stroke-width="3"/>
+      <circle cx="2200" cy="298" r="112" fill="#0B1E38" stroke="#45D8D4" stroke-opacity="0.76" stroke-width="5"/>
+      <path d="M2164 298h68m-28-28 28 28-28 28" fill="none" stroke="#61E4C3" stroke-linecap="round" stroke-linejoin="round" stroke-width="12"/>
+      <text x="146" y="174" fill="#59E2C0" font-size="48" font-weight="700" letter-spacing="6">03  /  TALK TO TEAM</text>
+      <text x="146" y="310" fill="#F4F8FF" font-size="106" font-weight="700">คุยกับทีม</text>
+      <text x="150" y="400" fill="#B7C9DC" font-size="48">ให้ทีม Donnar.Tech ช่วยดูแลต่อ</text>
+      <rect x="150" y="458" width="340" height="7" rx="4" fill="url(#mint)"/>
+    </g>
+  </g>
+</svg>
