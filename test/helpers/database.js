@@ -7,18 +7,27 @@ async function createTestDatabase({ migrate = true, config = {} } = {}) {
   const { Pool } = memory.adapters.createPg();
   const pool = new Pool();
   const poolQuery = pool.query.bind(pool);
+  let richMenuClaimLock = Promise.resolve();
   pool.query = async (sql, params) => {
     if (/^\s*DELETE FROM rich_menu_publications WHERE id = \$1 AND status = 'DRAFT'/i.test(String(sql))) {
       const { rows } = await poolQuery('SELECT id, status FROM rich_menu_publications WHERE id = $1', params);
       if (rows[0]?.status !== 'DRAFT') return { rows: [], rowCount: 0, command: 'DELETE' };
       return poolQuery('DELETE FROM rich_menu_publications WHERE id = $1', params);
     }
-    if (/^\s*UPDATE rich_menu_publications SET status = 'CREATING'.*WHERE id = \$1 AND status = 'FAILED' RETURNING id/i.test(String(sql))) {
-      const existing = await poolQuery('SELECT id, status FROM rich_menu_publications');
-      const row = existing.rows.find((item) => String(item.id) === String(params[0]));
-      if (row?.status !== 'FAILED') return { rows: [], rowCount: 0, command: 'UPDATE' };
-      await poolQuery("UPDATE rich_menu_publications SET status = 'CREATING' WHERE id = $1", [params[0]]);
-      return { rows: [{ id: row.id }], rowCount: 1, command: 'UPDATE' };
+    if (/^\s*UPDATE rich_menu_publications SET status = 'CREATING'.*WHERE id = \$1 AND status = \$2 RETURNING id/i.test(String(sql))) {
+      let release;
+      const previousClaim = richMenuClaimLock;
+      richMenuClaimLock = new Promise((resolve) => { release = resolve; });
+      await previousClaim;
+      try {
+        const existing = await poolQuery('SELECT id, status FROM rich_menu_publications');
+        const row = existing.rows.find((item) => String(item.id) === String(params[0]));
+        if (row?.status !== params[1]) return { rows: [], rowCount: 0, command: 'UPDATE' };
+        await poolQuery("UPDATE rich_menu_publications SET status = 'CREATING' WHERE id = $1", [params[0]]);
+        return { rows: [{ id: row.id }], rowCount: 1, command: 'UPDATE' };
+      } finally {
+        release();
+      }
     }
     const testQuery = testDatabaseQuery(sql, params);
     const result = await poolQuery(testQuery.sql, testQuery.params);
@@ -71,10 +80,15 @@ async function createTestDatabase({ migrate = true, config = {} } = {}) {
 }
 
 function testDatabaseQuery(sql, params) {
-  if (/^\s*INSERT INTO rich_menu_publications\b/i.test(String(sql)) && /image_data/i.test(String(sql)) && Buffer.isBuffer(params?.[0])) {
-    return { sql: String(sql).replace(/VALUES\s*\(\s*'DRAFT'\s*,\s*\$1\s*,/i, "VALUES ('DRAFT', decode($1, 'base64'),"), params: [params[0].toString('base64'), ...params.slice(1)] };
-  }
-  return { sql, params };
+  if (!Array.isArray(params) || !params.some(Buffer.isBuffer)) return { sql, params };
+  let rewrittenSql = String(sql);
+  const rewrittenParams = [...params];
+  params.forEach((value, index) => {
+    if (!Buffer.isBuffer(value)) return;
+    rewrittenSql = rewrittenSql.replace(new RegExp(`\\$${index + 1}(?!\\d)`, 'g'), `decode($${index + 1}, 'base64')`);
+    rewrittenParams[index] = value.toString('base64');
+  });
+  return { sql: rewrittenSql, params: rewrittenParams };
 }
 
 module.exports = { createTestDatabase };

@@ -81,7 +81,7 @@ class FakeLineMessagingClient {
   async reply(replyToken, messages) { this.sent.push({ kind: 'reply', replyToken, messages }); return {}; }
   async push(userId, messages) { this.sent.push({ kind: 'push', userId, messages }); return {}; }
   async createRichMenu(menu) { const id = `richmenu-test-${this.menus.length + 1}`; this.menus.push({ id, menu }); return { richMenuId: id }; }
-  async uploadRichMenuImage(menuId, image, contentType) { this.uploaded = { menuId, imageBytes: image.length, contentType }; }
+  async uploadRichMenuImage(menuId, image, contentType) { this.uploaded = { menuId, imageBytes: image.length, image: Buffer.from(image), contentType }; }
   async setDefaultRichMenu(menuId) { this.defaultMenuId = menuId; }
 }
 
