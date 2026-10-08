@@ -52,13 +52,15 @@ Production startup requires `DATABASE_URL`, `LINE_CHANNEL_SECRET`, `LINE_CHANNEL
 ## Data and behavior
 
 - Customer identity is the LINE user ID; customers do not create accounts.
-- PostgreSQL stores conversation state, messages, leads, editable copy revisions, staff sessions, audit events, and Rich Menu publication state.
+- PostgreSQL stores conversation state, messages, leads, cached LINE display names/profile photos, editable copy revisions, staff sessions, audit events, and Rich Menu publication state and image drafts.
 - Webhook deduplication and event-derived records are written in one transaction. Outbound message outcomes persist as `PENDING`, `SENDING`, `SENT`, `CANCELLED`, or `UNKNOWN`.
 - The Thai greeting and deterministic prompts collect service type, project summary, optional budget, and contact preference.
 - “คุยกับคน” and the third Rich Menu action switch the conversation to `HUMAN`, send one acknowledgement, and stop bot replies. Staff can inspect the lead, reply, and return the conversation to `BOT`.
 - The staff console uses scrypt login, HTTP-only sessions, CSRF checks, editable copy, audit records, and the Donnar.Tech logo.
-- Rich Menu creation requires an explicit action in the console and a second confirmation to replace an active menu.
-- Rich Menu buttons send visible chat messages that the webhook handles; the artwork is stored as a LINE-ready image in the repository.
+- LINE display names and profile photos are fetched after webhook processing, cached for up to 24 hours, and shown in the CRM when available. Profile lookup failures do not block replies; unavailable profiles fall back to the LINE UID.
+- In `/admin`, staff can upload and preview a Rich Menu draft. Images must be JPEG or PNG, exactly 2500 × 1686 pixels, and at most 1 MB. The validated image is stored in PostgreSQL; invalid uploads leave the current draft and live menu unchanged.
+- Upload and preview do not change the LINE OA. Staff must separately confirm `ยืนยันเปลี่ยน Rich Menu` to create the menu, upload the chosen bytes, and set it as default. The previous local publication is retained in history, while its stored image bytes are cleared after a successful switch.
+- Rich Menu buttons send visible chat messages that the webhook handles. After publication, users may need to reopen the chat for LINE to display the new default menu.
 - LINE requests use an injectable client. The fake adapter is used for local tests; credentials and customer message bodies are excluded from logs.
 
 ## Import existing SQLite data
