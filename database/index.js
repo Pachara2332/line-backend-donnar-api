@@ -3,11 +3,29 @@ const path = require('node:path');
 const { Pool } = require('pg');
 const { seedDefaultCopy } = require('./seed');
 
+const SUPABASE_ROOT_CA = fs.readFileSync(path.join(__dirname, 'certs/supabase-prod-ca-2021.crt'), 'utf8');
+
+function withoutSslQueryParameters(connectionString) {
+  const queryStart = connectionString.indexOf('?');
+  if (queryStart < 0) return connectionString;
+  const fragmentStart = connectionString.indexOf('#', queryStart);
+  const queryEnd = fragmentStart < 0 ? connectionString.length : fragmentStart;
+  const query = connectionString.slice(queryStart + 1, queryEnd);
+  const parameters = query.split('&').filter((parameter) => !/^(sslmode|sslrootcert|sslcert|sslkey)=/i.test(parameter));
+  const fragment = fragmentStart < 0 ? '' : connectionString.slice(fragmentStart);
+  return `${connectionString.slice(0, queryStart)}${parameters.length ? `?${parameters.join('&')}` : ''}${fragment}`;
+}
+
 function createDatabase(databaseUrl = process.env.DATABASE_URL) {
   if (!databaseUrl) throw new Error('DATABASE_URL is required to connect to PostgreSQL');
+  let isSupabase = false;
+  try {
+    const hostname = new URL(databaseUrl).hostname;
+    isSupabase = hostname.endsWith('.pooler.supabase.com') || hostname.endsWith('.supabase.co');
+  } catch {}
   return new Pool({
-    connectionString: databaseUrl,
-    ssl: { rejectUnauthorized: true },
+    connectionString: isSupabase ? withoutSslQueryParameters(databaseUrl) : databaseUrl,
+    ssl: isSupabase ? { ca: SUPABASE_ROOT_CA, rejectUnauthorized: true } : { rejectUnauthorized: true },
     max: 5,
     connectionTimeoutMillis: 5000,
     idleTimeoutMillis: 30000,
