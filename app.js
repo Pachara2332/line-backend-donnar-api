@@ -137,7 +137,7 @@ function buildApp({ db, lineClient, config }) {
       const creating = creatingRows[0];
       if (creating) return res.status(409).send('มีการเผยแพร่ Rich Menu กำลังดำเนินการอยู่');
       const image = fs.readFileSync(config.richMenuImagePath);
-      if (!validateRichMenuImage(image)) return res.status(400).send('ไฟล์ Rich Menu ต้องเป็น PNG ขนาด 2500 × 1686 และไม่เกิน 1 MB');
+      if (!validateRichMenuImage(image)) return res.status(400).send('ไฟล์ Rich Menu ต้องเป็น PNG หรือ JPEG ขนาด 2500 × 1686 และไม่เกิน 1 MB');
       const { rows: failedRows } = await db.query("SELECT id, line_menu_id, image_uploaded FROM rich_menu_publications WHERE status = 'FAILED' ORDER BY id DESC LIMIT 1");
       const failed = failedRows[0];
       if (failed && !failed.line_menu_id) return res.status(409).send('ผลการสร้างเมนูครั้งก่อนยังไม่แน่ชัด กรุณาตรวจ Rich Menu ใน LINE ก่อนเริ่มใหม่');
@@ -157,7 +157,7 @@ function buildApp({ db, lineClient, config }) {
         await db.query('UPDATE rich_menu_publications SET line_menu_id = $1 WHERE id = $2', [richMenuId, publicationId]);
       }
       if (!failed?.image_uploaded) {
-        await lineClient.uploadRichMenuImage(richMenuId, image, 'image/png');
+        await lineClient.uploadRichMenuImage(richMenuId, image, richMenuImageContentType(image));
         await db.query('UPDATE rich_menu_publications SET image_uploaded = TRUE WHERE id = $1', [publicationId]);
       }
       await lineClient.setDefaultRichMenu(richMenuId);
@@ -282,7 +282,35 @@ function readMessage(body) {
 function validateRichMenuImage(image) {
   if (!Buffer.isBuffer(image) || image.length < 24 || image.length > 1024 * 1024) return false;
   const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  return image.subarray(0, 8).equals(pngSignature) && image.readUInt32BE(16) === 2500 && image.readUInt32BE(20) === 1686;
+  if (image.subarray(0, 8).equals(pngSignature)) return image.readUInt32BE(16) === 2500 && image.readUInt32BE(20) === 1686;
+  const dimensions = readJpegDimensions(image);
+  return dimensions?.width === 2500 && dimensions?.height === 1686;
+}
+
+function richMenuImageContentType(image) {
+  return image[0] === 0xff && image[1] === 0xd8 ? 'image/jpeg' : 'image/png';
+}
+
+function readJpegDimensions(image) {
+  const startOfFrame = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+  if (image[0] !== 0xff || image[1] !== 0xd8) return null;
+  let offset = 2;
+  while (offset < image.length) {
+    if (image[offset++] !== 0xff) return null;
+    while (image[offset] === 0xff) offset++;
+    const marker = image[offset++];
+    if (marker === 0xd9 || marker === 0xda) return null;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 2 > image.length) return null;
+    const segmentLength = image.readUInt16BE(offset);
+    if (segmentLength < 2 || offset + segmentLength > image.length) return null;
+    if (startOfFrame.has(marker)) {
+      if (segmentLength < 7) return null;
+      return { height: image.readUInt16BE(offset + 3), width: image.readUInt16BE(offset + 5) };
+    }
+    offset += segmentLength;
+  }
+  return null;
 }
 
 function buildRichMenu() {
@@ -294,7 +322,7 @@ function buildRichMenu() {
 }
 
 function menuPreview(baseUrl) {
-  const image = '/assets/line-rich-menu-2500x1686.png?v=20261008-flat';
+  const image = '/assets/line-rich-menu-2500x1686.jpg?v=20261008-new-art';
   const menu = buildRichMenu();
   return shell('Rich Menu preview', `<section class="card"><h1>ตัวอย่าง Rich Menu</h1><p>สามปุ่ม: เริ่มโปรเจกต์, บริการของเรา, คุยกับทีม</p><img src="${image}" alt="Donnar.Tech Rich Menu" style="width:100%;height:auto"><p>แตะแล้วข้อความจะปรากฏในแชตและ backend ตอบตามหัวข้อ; ปุ่มคุยกับทีมจะหยุดบอตทันที</p><pre>${escapeHtml(JSON.stringify(menu.areas.map((area) => area.action), null, 2))}</pre><a class="button" href="/admin">กลับหน้าหลังบ้าน</a></section>`);
 }

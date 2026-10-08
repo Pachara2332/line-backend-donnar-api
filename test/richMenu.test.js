@@ -7,7 +7,7 @@ const { buildRichMenu, validateRichMenuImage, buildApp } = require('../app');
 const { createTestDatabase } = require('./helpers/database');
 const { FakeLineMessagingClient } = require('../service/lineMessagingClient');
 
-const assetPath = path.join(__dirname, '..', 'assets/line-rich-menu-2500x1686.png');
+const assetPath = path.join(__dirname, '..', 'assets/line-rich-menu-2500x1686.jpg');
 const config = { lineChannelSecret: 'secret', lineAccessToken: '', fakeLineMode: true, staffUsername: 'operator', publicBaseUrl: 'http://localhost', richMenuImagePath: assetPath };
 
 async function setup(t) {
@@ -27,13 +27,12 @@ async function setup(t) {
   return { db, lineClient, app, cookie, csrf, publish };
 }
 
-test('accepts only the taller 2500 by 1686 PNG image within LINE limits', () => {
+test('accepts the taller 2500 by 1686 JPEG image within LINE limits', () => {
   const image = fs.readFileSync(assetPath);
   assert.equal(validateRichMenuImage(image), true);
-  assert.equal(image.readUInt32BE(16), 2500);
-  assert.equal(image.readUInt32BE(20), 1686);
+  assert.deepEqual([...image.subarray(0, 3)], [0xff, 0xd8, 0xff]);
   assert.ok(image.length <= 1024 * 1024);
-  assert.equal(validateRichMenuImage(Buffer.from('not a png')), false);
+  assert.equal(validateRichMenuImage(Buffer.from('not an image')), false);
 });
 
 test('creates three full-width stacked message actions at the same coordinates as the image', () => {
@@ -54,11 +53,10 @@ test('shows the tall branded image in the staff preview', async (t) => {
   const { app, cookie, csrf } = await setup(t);
   const response = await request(app).post('/admin/rich-menu/preview').set('cookie', cookie).type('form').send({ _csrf: csrf });
   assert.equal(response.status, 200);
-  assert.match(response.text, /\/assets\/line-rich-menu-2500x1686\.png/);
-  const image = await request(app).get('/assets/line-rich-menu-2500x1686.png');
+  assert.match(response.text, /\/assets\/line-rich-menu-2500x1686\.jpg/);
+  const image = await request(app).get('/assets/line-rich-menu-2500x1686.jpg');
   assert.equal(image.status, 200);
-  assert.equal(image.body.readUInt32BE(16), 2500);
-  assert.equal(image.body.readUInt32BE(20), 1686);
+  assert.deepEqual([...image.body.subarray(0, 3)], [0xff, 0xd8, 0xff]);
 });
 
 test('publishes through the fake adapter and requires explicit confirmation to replace a published menu', async (t) => {
