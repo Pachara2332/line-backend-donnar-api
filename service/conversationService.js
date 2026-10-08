@@ -1,6 +1,7 @@
 const { createHash } = require('node:crypto');
 const { getCopy } = require('./messageCatalog');
 const { buildWelcomeCard } = require('./welcomeCard');
+const { buildProjectIntakeCard, buildServicesCard, buildInfoCard, buildHandoffCard, buildIntakeReceivedCard } = require('./responseCards');
 const { withTransaction } = require('../database');
 
 const QUESTIONS = ['serviceType', 'projectSummary', 'budgetRange', 'contactPreference'];
@@ -95,8 +96,7 @@ function createConversationService({ db, lineClient, liffId = '' }) {
   }
 
   function startQualifyMessage(serviceTypeCopy) {
-    if (!liffId) return { type: 'text', text: serviceTypeCopy };
-    return { type: 'template', altText: 'กรอกรายละเอียดโปรเจกต์', template: { type: 'buttons', text: 'กดปุ่มเพื่อกรอกรายละเอียดโปรเจกต์ หรือพิมพ์ประเภทงานที่สนใจตอบในแชตได้เลยครับ', actions: [{ type: 'uri', label: 'เปิดฟอร์มปรึกษาโปรเจกต์', uri: `https://liff.line.me/${liffId}` }] } };
+    return buildProjectIntakeCard(serviceTypeCopy, liffId);
   }
 
   async function processEventState(client, event, id) {
@@ -140,7 +140,7 @@ function createConversationService({ db, lineClient, liffId = '' }) {
       if (conversation.mode === 'BOT') {
         await client.query("UPDATE conversations SET mode = 'HUMAN', handoff_reason = 'customer_request', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
         await client.query("UPDATE leads SET status = 'HUMAN_REQUIRED', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1", [conversation.id]);
-        await queueReply(await getCopy(client, 'handoff'), true);
+        await queueMessage(buildHandoffCard(await getCopy(client, 'handoff')), true);
       }
       return { processed: true, mode: 'HUMAN' };
     }
@@ -152,24 +152,28 @@ function createConversationService({ db, lineClient, liffId = '' }) {
         await client.query("UPDATE conversations SET current_step = 'serviceType', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
         await client.query("UPDATE leads SET requirements_json = '{}'::jsonb, status = 'QUALIFYING', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1", [conversation.id]);
         await queueMessage(startQualifyMessage(await getCopy(client, 'serviceType')));
-      } else if (action === 'SERVICES') await queueReply(await getCopy(client, 'services'));
-      else if (action === 'WORKFLOW') await queueReply(await getCopy(client, 'workflow'));
-      else if (action === 'PORTFOLIO') await queueReply(await getCopy(client, 'portfolio'));
-      else if (action === 'QUOTE') await queueReply(await getCopy(client, 'serviceType'));
+      } else if (action === 'CHAT_INTAKE') {
+        await client.query("UPDATE conversations SET current_step = 'serviceType', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
+        await client.query("UPDATE leads SET requirements_json = '{}'::jsonb, status = 'QUALIFYING', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1", [conversation.id]);
+        await queueReply(await getCopy(client, 'serviceType'));
+      } else if (action === 'SERVICES') await queueMessage(buildServicesCard(await getCopy(client, 'services'), liffId));
+      else if (action === 'WORKFLOW') await queueMessage(buildInfoCard({ eyebrow: 'ขั้นตอนทำงาน', title: 'จากโจทย์สู่ระบบที่ใช้งานได้', description: await getCopy(client, 'workflow'), accent: '#16C7C2', liffId }));
+      else if (action === 'PORTFOLIO') await queueMessage(buildInfoCard({ eyebrow: 'ผลงานและแนวทาง', title: 'หาแนวทางที่เหมาะกับโจทย์คุณ', description: await getCopy(client, 'portfolio'), accent: '#F47721', liffId }));
+      else if (action === 'QUOTE') await queueMessage(startQualifyMessage(await getCopy(client, 'serviceType')));
       return { processed: true };
     }
 
     if (event.type !== 'message' || event.message?.type !== 'text') return { processed: true };
     const text = incomingText.trim();
     if (!text) return { processed: true };
-    if (/^(เริ่มปรึกษาโปรเจกต์|ปรึกษาโปรเจกต์)$/i.test(text)) {
+    if (/^(เริ่มปรึกษาโปรเจกต์|ปรึกษาโปรเจกต์|อยากปรึกษาโปรเจกต์)$/i.test(text)) {
       await client.query("UPDATE conversations SET current_step = 'serviceType', updated_at = CURRENT_TIMESTAMP WHERE id = $1", [conversation.id]);
       await client.query("UPDATE leads SET requirements_json = '{}'::jsonb, status = 'QUALIFYING', updated_at = CURRENT_TIMESTAMP WHERE conversation_id = $1", [conversation.id]);
       await queueMessage(startQualifyMessage(await getCopy(client, 'serviceType')));
       return { processed: true };
     }
     if (/^(ขอดูบริการ|บริการของเรา|services)$/i.test(text)) {
-      await queueReply(await getCopy(client, 'services'));
+      await queueMessage(buildServicesCard(await getCopy(client, 'services'), liffId));
       return { processed: true };
     }
     if (conversation.current_step === 'serviceType' && /^services$/i.test(text)) {
@@ -177,7 +181,7 @@ function createConversationService({ db, lineClient, liffId = '' }) {
       return { processed: true };
     }
     if (conversation.current_step === 'complete') {
-      await queueReply(await getCopy(client, 'fallback'));
+      await queueMessage(buildInfoCard({ eyebrow: 'Donnar.Tech พร้อมช่วยต่อ', title: 'อยากไปต่อทางไหนครับ?', description: await getCopy(client, 'fallback'), accent: '#16C7C2', liffId }));
       return { processed: true };
     }
 
@@ -240,8 +244,9 @@ function createConversationService({ db, lineClient, liffId = '' }) {
       await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id) VALUES ($1, 'IN', 'liff_intake', $2, $3)", [conversation.id, summary, id]);
       const text = conversation.mode === 'HUMAN'
         ? 'ได้รับรายละเอียดโปรเจกต์แล้วครับ ทีม Donnar.Tech มีข้อมูลนี้แล้วและจะตอบในแชตนี้'
-        : 'ได้รับรายละเอียดโปรเจกต์แล้วครับ ทีม Donnar.Tech จะตรวจสอบและติดต่อกลับในแชตนี้ หากต้องการคุยกับทีมทันที พิมพ์ “คุยกับคน” ได้เลยครับ';
-      await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id, send_status, allow_human_mode) VALUES ($1, 'OUT', 'text', $2, $3, 'PENDING', TRUE)", [conversation.id, JSON.stringify({ type: 'text', text }), id]);
+        : 'ได้รับรายละเอียดโปรเจกต์แล้วครับ ทีม Donnar.Tech จะตรวจสอบข้อมูลและตอบกลับในแชตนี้ หากอยากคุยกับทีมโดยตรง พิมพ์ “คุยกับคน” ได้เลยครับ';
+      const confirmation = buildIntakeReceivedCard(text);
+      await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id, send_status, allow_human_mode) VALUES ($1, 'OUT', 'flex', $2, $3, 'PENDING', TRUE)", [conversation.id, JSON.stringify(confirmation), id]);
       return true;
     });
     try {

@@ -111,7 +111,7 @@ test('rich menu first area opens LIFF only when configured', () => {
   assert.deepEqual(buildRichMenu(LIFF_ID).areas.slice(1).map((area) => area.action.text), ['ขอดูบริการ', 'คุยกับคน']);
 });
 
-test('old START_QUALIFY postback replies with a form button and keeps chat intake', async () => {
+test('old START_QUALIFY postback replies with form and chat choices', async () => {
   const { createHmac } = require('node:crypto');
   const { app, db, close } = await setup();
   const sent = [];
@@ -119,7 +119,9 @@ test('old START_QUALIFY postback replies with a form button and keeps chat intak
   const rawBody = JSON.stringify({ events: [{ type: 'postback', replyToken: 'r1', source: { type: 'user', userId: USER }, webhookEventId: 'evt-old-card', postback: { data: 'action=START_QUALIFY' } }] });
   const response = await request(app).post('/webhooks/line').set('x-line-signature', createHmac('sha256', 'test-secret').update(rawBody).digest('base64')).set('content-type', 'application/json').send(rawBody);
   assert.equal(response.status, 200);
-  assert.equal(sent[0].template.actions[0].uri, `https://liff.line.me/${LIFF_ID}`);
+  assert.equal(sent[0].type, 'flex');
+  assert.deepEqual(sent[0].contents.footer.contents.map((button) => button.action.type), ['uri', 'postback']);
+  assert.equal(sent[0].contents.footer.contents[0].action.uri, `https://liff.line.me/${LIFF_ID}`);
   assert.equal((await db.query('SELECT current_step FROM conversations')).rows[0].current_step, 'serviceType');
   await close();
 });
