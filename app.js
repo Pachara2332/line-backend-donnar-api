@@ -294,7 +294,7 @@ function buildRichMenu() {
 }
 
 function menuPreview(baseUrl) {
-  const image = '/assets/line-rich-menu-2500x1686.png';
+  const image = '/assets/line-rich-menu-2500x1686.png?v=20261008-flat';
   const menu = buildRichMenu();
   return shell('Rich Menu preview', `<section class="card"><h1>ตัวอย่าง Rich Menu</h1><p>สามปุ่ม: เริ่มโปรเจกต์, บริการของเรา, คุยกับทีม</p><img src="${image}" alt="Donnar.Tech Rich Menu" style="width:100%;height:auto"><p>แตะแล้วข้อความจะปรากฏในแชตและ backend ตอบตามหัวข้อ; ปุ่มคุยกับทีมจะหยุดบอตทันที</p><pre>${escapeHtml(JSON.stringify(menu.areas.map((area) => area.action), null, 2))}</pre><a class="button" href="/admin">กลับหน้าหลังบ้าน</a></section>`);
 }
