@@ -24,3 +24,23 @@ services:
         sync: false
       - key: LIFF_ID
         sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: SELLER_NAME
+        sync: false
+      - key: SELLER_TAX_ID
+        sync: false
+      - key: SELLER_BRANCH_CODE
+        sync: false
+      - key: SELLER_ADDRESS
+        sync: false
+      - key: SELLER_PHONE
+        sync: false
+      - key: SELLER_EMAIL
+        sync: false
+      - key: SELLER_WEBSITE
+        sync: false
+      - key: SELLER_BANK_ACCOUNT
+        sync: false
+      - key: SELLER_VAT_REGISTERED
+        sync: false
