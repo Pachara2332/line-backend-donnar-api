@@ -11,11 +11,56 @@ const { createConversationService } = require('./service/conversationService');
 const { DEFAULT_COPY } = require('./service/messageCatalog');
 const { withTransaction } = require('./database');
 const { verifyIdToken, parseIntake, intakePage, channelIdFromLiffId } = require('./service/liffIntake');
+const { escapeHtml } = require('./service/html');
+const { createQuotationService, parseQuotationForm, normalizeQuotation, bangkokToday, effectiveStatus, formatMoney, formatThaiDate, quotationLabel } = require('./service/quotations');
+const { renderQuotationPdf } = require('./service/quotationPdf');
+const { ADMIN_STYLE, quotationListPage, quotationEditorPage, quotationViewPage, conversationQuotationPanel, decisionPanel, publicQuotationPage, publicNotFoundPage, editorModel, formModel } = require('./service/quotationPages');
+const { buildQuotationCard } = require('./service/responseCards');
 
 function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
   const app = express();
   const conversations = createConversationService({ db, lineClient, liffId: config.liffId });
+  const seller = config.seller || {};
+  const quotations = createQuotationService({ db, seller });
   app.locals.lineClient = lineClient;
+
+  async function deliverPush(conversation, message) {
+    const { rows: outgoingRows } = await db.query("INSERT INTO messages(conversation_id, direction, message_type, body, send_status, attempts) VALUES ($1, 'OUT', $2, $3, 'SENDING', 1) RETURNING id", [conversation.id, message.type, JSON.stringify(message)]);
+    const outgoingId = outgoingRows[0].id;
+    try {
+      await lineClient.push(conversation.line_user_id, [message]);
+      await db.query("UPDATE messages SET send_status = 'SENT' WHERE id = $1 AND send_status = 'SENDING'", [outgoingId]);
+    } catch (error) {
+      const status = error.retryable ? 'PENDING' : 'UNKNOWN';
+      const category = error.retryable ? 'line_rate_limited' : (Number.isInteger(error.status) ? `line_http_${error.status}` : 'delivery_outcome_unknown');
+      await db.query("UPDATE messages SET send_status = $1, last_error = $2 WHERE id = $3 AND send_status = 'SENDING'", [status, category, outgoingId]);
+      throw error;
+    }
+    return outgoingId;
+  }
+
+  const quotationLink = (token) => `${String(config.publicBaseUrl || '').replace(/\/$/, '')}/q/${token}`;
+
+  async function pushQuotationCard(quotation) {
+    const { rows } = await db.query('SELECT id, line_user_id FROM conversations WHERE id = $1', [quotation.conversation_id]);
+    if (!rows[0]) return false;
+    const card = buildQuotationCard({ label: quotationLabel(quotation), title: quotation.title, total: formatMoney(quotation.total_satang), validUntil: formatThaiDate(quotation.valid_until), url: quotationLink(quotation.public_token) });
+    try {
+      await deliverPush(rows[0], card);
+      return true;
+    } catch (error) {
+      console.error('quotation card delivery failed', { quotationId: quotation.id, status: error.status || null });
+      return false;
+    }
+  }
+
+  async function sendQuotationPdf(res, quotation, items, disposition) {
+    const pdf = await renderQuotationPdf({ quotation, items, seller, today: bangkokToday() });
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Disposition', `${disposition}; filename="${quotationLabel(quotation)}.pdf"`);
+    return res.type('application/pdf').send(pdf);
+  }
 
   app.disable('x-powered-by');
   app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], imgSrc: ["'self'", 'data:', 'https:'], styleSrc: ["'self'", "'unsafe-inline'"], formAction: ["'self'"], objectSrc: ["'none'"], baseUri: ["'self'"] } } }));
@@ -42,6 +87,39 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       if (!intake) return res.status(400).json({ error: 'Invalid project brief' });
       const result = await conversations.submitIntake(identity.userId, intake.submissionId, intake.brief, intake.summary);
       return res.json({ saved: true, confirmationSent: result.confirmationSent });
+    } catch (error) { return next(error); }
+  });
+
+  const publicQuotationLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
+  const publicDecisionLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
+  const loadPublicQuotation = async (req, res, next) => {
+    try {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+      const token = String(req.params.token || '');
+      const loaded = /^[A-Za-z0-9_-]{43}$/.test(token) ? await quotations.loadByToken(token) : null;
+      if (!loaded || loaded.quotation.status === 'DRAFT') return res.status(404).type('html').send(publicNotFoundPage());
+      req.quotation = loaded;
+      req.quotationToken = token;
+      return next();
+    } catch (error) { return next(error); }
+  };
+  app.get('/q/:token', publicQuotationLimit, loadPublicQuotation, (req, res) => res.type('html').send(publicQuotationPage({ ...req.quotation, token: req.quotationToken, today: bangkokToday() })));
+  app.get('/q/:token/pdf', publicQuotationLimit, loadPublicQuotation, async (req, res, next) => {
+    try { return await sendQuotationPdf(res, req.quotation.quotation, req.quotation.items, 'inline'); } catch (error) { return next(error); }
+  });
+  app.post('/q/:token/:decision', publicDecisionLimit, express.urlencoded({ extended: false, limit: '8kb' }), loadPublicQuotation, async (req, res, next) => {
+    try {
+      const decision = req.params.decision;
+      if (!['accept', 'reject'].includes(decision)) return res.sendStatus(404);
+      const name = String(req.body?.name || '').trim();
+      const reason = String(req.body?.reason || '').trim();
+      const invalid = decision === 'accept'
+        ? (!name || name.length > 120 ? 'กรอกชื่อผู้อนุมัติ (ไม่เกิน 120 ตัวอักษร)' : (req.body?.agree !== 'on' ? 'กรุณาทำเครื่องหมายยอมรับเงื่อนไขก่อนยืนยัน' : ''))
+        : (reason.length > 1000 ? 'เหตุผลยาวเกิน 1,000 ตัวอักษร' : '');
+      if (invalid) return res.status(400).type('html').send(publicQuotationPage({ ...req.quotation, token: req.quotationToken, today: bangkokToday(), error: invalid }));
+      await quotations.decide(req.quotationToken, decision, decision === 'accept' ? name : null, decision === 'reject' ? reason : null);
+      return res.redirect(303, `/q/${req.quotationToken}`);
     } catch (error) { return next(error); }
   });
 
@@ -80,6 +158,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     } catch (error) { next(error); }
   });
 
+  app.use('/admin/quotations', express.urlencoded({ extended: false, limit: '256kb', parameterLimit: 1000 }));
   app.use('/admin', express.urlencoded({ extended: false, limit: '20kb' }), requireStaff(db, config));
   const richMenuUploadLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
   app.post('/admin/rich-menu/draft', richMenuUploadLimit, parseRichMenuUpload, requireCsrf, async (req, res, next) => {
@@ -154,17 +233,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       const conversation = conversations[0];
       if (!conversation) return res.sendStatus(404);
       if (conversation.mode !== 'HUMAN') return res.status(409).send('เปลี่ยนสถานะเป็น HUMAN ก่อนตอบแชต');
-      const { rows: outgoingRows } = await db.query("INSERT INTO messages(conversation_id, direction, message_type, body, send_status, attempts) VALUES ($1, 'OUT', 'text', $2, 'SENDING', 1) RETURNING id", [conversation.id, JSON.stringify({ type: 'text', text })]);
-      const outgoingId = outgoingRows[0].id;
-      try {
-        await lineClient.push(conversation.line_user_id, [{ type: 'text', text }]);
-        await db.query("UPDATE messages SET send_status = 'SENT' WHERE id = $1 AND send_status = 'SENDING'", [outgoingId]);
-      } catch (error) {
-        const status = error.retryable ? 'PENDING' : 'UNKNOWN';
-        const category = error.retryable ? 'line_rate_limited' : (Number.isInteger(error.status) ? `line_http_${error.status}` : 'delivery_outcome_unknown');
-        await db.query("UPDATE messages SET send_status = $1, last_error = $2 WHERE id = $3 AND send_status = 'SENDING'", [status, category, outgoingId]);
-        throw error;
-      }
+      const outgoingId = await deliverPush(conversation, { type: 'text', text });
       await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'conversation.staff_reply', 'message', String(outgoingId), JSON.stringify({ conversationId: conversation.id })]);
       return res.redirect(303, `/admin?conversation=${encodeURIComponent(req.params.id)}#inbox`);
     } catch (error) { return next(error); }
@@ -176,6 +245,118 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       const outcome = await conversations.refreshProfileForConversation(conversationId, { force: true });
       if (outcome === 'missing') return res.sendStatus(404);
       return res.redirect(303, `/admin?conversation=${encodeURIComponent(conversationId)}&profile=${encodeURIComponent(outcome)}#inbox`);
+    } catch (error) { return next(error); }
+  });
+  app.post('/admin/conversations/:id/quotations', requireCsrf, async (req, res, next) => {
+    const conversationId = positiveId(req.params.id);
+    if (!conversationId) return res.sendStatus(404);
+    try {
+      const quotationId = await quotations.createDraft(conversationId, req.staff.username);
+      if (!quotationId) return res.sendStatus(404);
+      return res.redirect(303, `/admin/quotations/${quotationId}`);
+    } catch (error) { return next(error); }
+  });
+  app.get('/admin/quotations', async (req, res, next) => {
+    try {
+      const { rows } = await db.query('SELECT q.*, c.line_user_id, u.display_name FROM quotations q JOIN conversations c ON c.id = q.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id ORDER BY q.updated_at DESC, q.id DESC LIMIT 300');
+      const statusFilter = ['DRAFT', 'SENT', 'ACCEPTED', 'REJECTED', 'EXPIRED', 'SUPERSEDED', 'CANCELLED'].includes(req.query.status) ? req.query.status : '';
+      return res.type('html').send(shell('ใบเสนอราคา', quotationListPage({ rows: rows.map(normalizeQuotation), staff: req.staff, csrfToken: req.csrfToken, seller, statusFilter, today: bangkokToday() })));
+    } catch (error) { return next(error); }
+  });
+  const renderEditor = (res, req, loaded, { status = 200, model, errors = [], notice = '' } = {}) => res.status(status).type('html').send(shell(`แก้ไข ${quotationLabel(loaded.quotation)}`, quotationEditorPage({ quotation: loaded.quotation, model: model || editorModel(loaded.quotation, loaded.items), errors, staff: req.staff, csrfToken: req.csrfToken, seller, vatRateBp: quotations.vatRateBp(), notice }), ['/assets/quotation-editor.js']));
+  const loadStaffQuotation = async (req, res, next) => {
+    const quotationId = positiveId(req.params.id);
+    if (!quotationId) return res.sendStatus(404);
+    try {
+      const loaded = await quotations.load(quotationId);
+      if (!loaded) return res.sendStatus(404);
+      req.quotation = loaded;
+      return next();
+    } catch (error) { return next(error); }
+  };
+  app.get('/admin/quotations/:id', loadStaffQuotation, async (req, res, next) => {
+    try {
+      const { quotation, items } = req.quotation;
+      if (quotation.status === 'DRAFT') return renderEditor(res, req, req.quotation, { notice: req.query.saved ? '<div class="q-alert ok">บันทึกฉบับร่างแล้ว</div>' : '' });
+      const { rows: history } = await db.query('SELECT id, number, revision, status, valid_until, total_satang FROM quotations WHERE number = $1 ORDER BY revision', [quotation.number]);
+      return res.type('html').send(shell(quotationLabel(quotation), quotationViewPage({ quotation, items, history: history.map(normalizeQuotation), staff: req.staff, csrfToken: req.csrfToken, link: quotation.public_token ? quotationLink(quotation.public_token) : '', today: bangkokToday(), flash: req.query.flash }), ['/assets/quotation-editor.js']));
+    } catch (error) { return next(error); }
+  });
+  const saveDraftFromForm = async (req, res) => {
+    const { errors, values } = parseQuotationForm(req.body);
+    if (errors.length) { renderEditor(res, req, req.quotation, { status: 400, model: formModel(values, req.body), errors }); return false; }
+    const outcome = await quotations.saveDraft(req.quotation.quotation.id, values, req.staff.username);
+    if (outcome !== 'saved') { res.redirect(303, `/admin/quotations/${req.quotation.quotation.id}`); return false; }
+    return true;
+  };
+  app.post('/admin/quotations/:id', loadStaffQuotation, requireCsrf, async (req, res, next) => {
+    try {
+      if (await saveDraftFromForm(req, res)) return res.redirect(303, `/admin/quotations/${req.quotation.quotation.id}?saved=1`);
+    } catch (error) { return next(error); }
+  });
+  app.post('/admin/quotations/:id/preview', loadStaffQuotation, requireCsrf, async (req, res, next) => {
+    try {
+      if (await saveDraftFromForm(req, res)) return res.redirect(303, `/admin/quotations/${req.quotation.quotation.id}/pdf`);
+    } catch (error) { return next(error); }
+  });
+  app.post('/admin/quotations/:id/send', loadStaffQuotation, requireCsrf, async (req, res, next) => {
+    try {
+      const id = req.quotation.quotation.id;
+      const setupError = !seller.name || !seller.taxId
+        ? 'ตั้งค่า SELLER_NAME และ SELLER_TAX_ID ของผู้ขายก่อนส่งใบเสนอราคา'
+        : (config.isProduction && !/^https:\/\//.test(config.publicBaseUrl || '') ? 'ตั้งค่า PUBLIC_BASE_URL เป็น https ก่อนส่งลิงก์ใบเสนอราคาให้ลูกค้า' : '');
+      if (setupError) {
+        const { values } = parseQuotationForm(req.body);
+        return renderEditor(res, req, req.quotation, { status: 409, model: formModel(values, req.body), errors: [setupError] });
+      }
+      if (!(await saveDraftFromForm(req, res))) return undefined;
+      const issued = await quotations.issue(id, req.staff.username);
+      if (issued.outcome === 'invalid') {
+        const reloaded = await quotations.load(id);
+        return renderEditor(res, req, reloaded, { status: 400, errors: issued.errors });
+      }
+      if (issued.outcome !== 'issued') return res.redirect(303, `/admin/quotations/${id}`);
+      const { quotation } = await quotations.load(id);
+      const delivered = await pushQuotationCard(quotation);
+      return res.redirect(303, `/admin/quotations/${id}?flash=${delivered ? 'sent' : 'push-failed'}`);
+    } catch (error) { return next(error); }
+  });
+  app.get('/admin/quotations/:id/pdf', loadStaffQuotation, async (req, res, next) => {
+    try { return await sendQuotationPdf(res, req.quotation.quotation, req.quotation.items, 'inline'); } catch (error) { return next(error); }
+  });
+  app.post('/admin/quotations/:id/resend', loadStaffQuotation, requireCsrf, async (req, res, next) => {
+    try {
+      const { quotation } = req.quotation;
+      if (effectiveStatus(quotation, bangkokToday()) !== 'SENT') return res.status(409).send('ส่งการ์ดได้เฉพาะใบเสนอราคาที่รอลูกค้าตอบรับ');
+      const delivered = await pushQuotationCard(quotation);
+      await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'quotation.card_resent', 'quotation', String(quotation.id), JSON.stringify({ delivered })]);
+      return res.redirect(303, `/admin/quotations/${quotation.id}?flash=${delivered ? 'resent' : 'push-failed'}`);
+    } catch (error) { return next(error); }
+  });
+  app.post('/admin/quotations/:id/revise', loadStaffQuotation, requireCsrf, async (req, res, next) => {
+    try {
+      const result = await quotations.revise(req.quotation.quotation.id, req.staff.username);
+      if (!['created', 'exists'].includes(result.outcome)) return res.status(409).send('แก้ไขเป็นฉบับใหม่ได้เฉพาะใบเสนอราคาที่ส่งแล้วและยังไม่ได้รับการยอมรับ');
+      return res.redirect(303, `/admin/quotations/${result.id}`);
+    } catch (error) { return next(error); }
+  });
+  app.post('/admin/quotations/:id/cancel', loadStaffQuotation, requireCsrf, async (req, res, next) => {
+    try {
+      if (!(await quotations.cancel(req.quotation.quotation.id, req.staff.username))) return res.status(409).send('ยกเลิกได้เฉพาะใบเสนอราคาที่รอลูกค้าตอบรับ');
+      return res.redirect(303, `/admin/quotations/${req.quotation.quotation.id}?flash=cancelled`);
+    } catch (error) { return next(error); }
+  });
+  app.post('/admin/quotations/:id/delete', loadStaffQuotation, requireCsrf, async (req, res, next) => {
+    try {
+      const conversationId = await quotations.deleteDraft(req.quotation.quotation.id, req.staff.username);
+      if (!conversationId) return res.status(409).send('ลบได้เฉพาะฉบับร่าง');
+      return res.redirect(303, `/admin?conversation=${conversationId}#inbox`);
+    } catch (error) { return next(error); }
+  });
+  app.post('/admin/quotations/:id/decision/read', loadStaffQuotation, requireCsrf, async (req, res, next) => {
+    try {
+      await quotations.markDecisionRead(req.quotation.quotation.id);
+      return res.redirect(303, `/admin/quotations/${req.quotation.quotation.id}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/content/draft', requireCsrf, async (req, res, next) => {
@@ -253,6 +434,11 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
   return app;
 }
 
+function positiveId(value) {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
 function hashToken(token) { return createHash('sha256').update(token).digest('hex'); }
 
 function verifyPassword(password, encoded) {
@@ -324,10 +510,6 @@ function parseRichMenuUpload(req, res, next) {
   });
 }
 
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
-}
-
 function isValidWebhookEvent(event) {
   if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string' || !event.type) return false;
   if (!['follow', 'message', 'postback', 'unfollow'].includes(event.type)) return true;
@@ -341,7 +523,7 @@ function isValidWebhookEvent(event) {
   return true;
 }
 
-function shell(title, content) {
+function shell(title, content, scripts = []) {
   return `<!doctype html><html lang="th"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Donnar.Tech</title><style>
   *{box-sizing:border-box} :root{color-scheme:light;--ink:#14233b;--muted:#718096;--line:#e3eaf2;--blue:#1769e8;--navy:#0d1b33;--surface:#fff;--wash:#f4f7fb;--green:#0e9f79}
   body{margin:0;background:var(--wash);color:var(--ink);font:15px/1.55 Inter,"Noto Sans Thai",system-ui,-apple-system,sans-serif}header{background:var(--navy);color:white;padding:12px max(20px,calc((100vw - 1380px)/2));display:flex;align-items:center;gap:12px;min-height:68px;box-shadow:0 4px 18px #0d1b3318}header img{width:42px;height:42px;object-fit:contain;background:white;border-radius:12px;padding:3px}header strong{font-size:15px;letter-spacing:.01em}main{max-width:1380px;margin:28px auto;padding:0 24px}.card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:20px;margin:16px 0;box-shadow:0 8px 28px #14233b08}h1,h2,h3{line-height:1.25;letter-spacing:-.02em}h1{font-size:clamp(25px,3vw,34px);margin:0 0 6px}h2{font-size:19px;margin:0 0 14px}h3{font-size:16px}p{margin:.35em 0 1em}button,a.button{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:0;border-radius:10px;background:var(--blue);color:white;padding:10px 15px;text-decoration:none;font-family:inherit;font-size:14px;font-weight:600;line-height:1.2;cursor:pointer;transition:background .16s,transform .16s}button:hover,a.button:hover{background:#0d55c7;transform:translateY(-1px)}button.secondary{background:#eaf1fb;color:#21416e}button.secondary:hover{background:#dce8f8}button.danger{background:#e9f7f2;color:#087c61}input,textarea,select{font:inherit;width:100%;padding:10px 12px;border:1px solid #d4deea;border-radius:10px;margin:5px 0 10px;background:white;color:var(--ink)}input:focus,textarea:focus,select:focus{outline:3px solid #1769e822;border-color:#6b9ff0}textarea{min-height:92px;resize:vertical}label{display:block;font-size:13px;font-weight:600;color:#40516b}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid var(--line);vertical-align:top}.tag{display:inline-flex;align-items:center;font-size:12px;font-weight:700;padding:4px 9px;border-radius:999px;background:#e4f6ef;color:#087c61}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.chat{white-space:pre-wrap;max-width:620px}small,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.crm-top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:22px}.eyebrow{font-size:12px;font-weight:750;letter-spacing:.1em;text-transform:uppercase;color:var(--blue);margin-bottom:5px}.user-tools{display:flex;align-items:center;gap:12px}.user-tools form{margin:0}.user-tools button{padding:8px 12px}.crm-nav{display:flex;gap:8px;margin:0 0 18px}.crm-nav a{color:#56667d;text-decoration:none;padding:8px 12px;border-radius:9px;font-size:14px;font-weight:650}.crm-nav a.active,.crm-nav a:hover{background:#e9f1fd;color:var(--blue)}.metric-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0 0 18px}.metric{padding:15px 18px;background:white;border:1px solid var(--line);border-radius:14px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{font-size:25px;line-height:1.2}.metric.blue strong{color:var(--blue)}.metric.green strong{color:var(--green)}.metric.orange strong{color:#d77a12}.inbox{display:grid;grid-template-columns:minmax(280px,360px) minmax(0,1fr);min-height:620px;background:white;border:1px solid var(--line);border-radius:17px;overflow:hidden;box-shadow:0 10px 30px #14233b0a}.inbox-sidebar{border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0}.inbox-heading{padding:18px 18px 8px}.inbox-heading h2{margin:0}.filters{padding:0 16px 12px;border-bottom:1px solid var(--line)}.filters input,.filters select{margin:5px 0}.lead-list{overflow:auto;max-height:740px}.lead-link{display:block;padding:14px 17px;border-bottom:1px solid #edf1f6;color:inherit;text-decoration:none;transition:background .15s;border-left:3px solid transparent}.lead-link:hover{background:#f6f9fd}.lead-link.selected{background:#eef5ff;border-left-color:var(--blue)}.lead-link-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}.lead-link-top strong{font-size:14px}.lead-preview{color:#586981;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:5px}.lead-meta{font-size:11px;color:var(--muted);display:flex;gap:6px;align-items:center;flex-wrap:wrap}.mode-tag{font-size:10px;letter-spacing:.04em;padding:2px 7px;border-radius:99px;background:#e9eff8;color:#53647b;font-weight:750}.mode-tag.human{background:#fff1df;color:#a75a06}.mode-tag.bot{background:#e6f7f1;color:#078263}.inbox-detail{display:flex;flex-direction:column;min-width:0}.detail-head{padding:20px 22px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.detail-head h2{margin:0 0 4px}.detail-grid{display:grid;grid-template-columns:minmax(0,1fr) 230px;flex:1;min-height:0}.message-history{padding:18px 22px;overflow:auto;max-height:530px;background:linear-gradient(#fbfcfe,#f8fafd)}.message{max-width:min(78%,600px);padding:11px 13px;border-radius:14px;margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere;box-shadow:0 2px 8px #14233b08}.message.in{background:white;border:1px solid var(--line);border-top-left-radius:4px}.message.out{background:#e8f1ff;border:1px solid #d9e8ff;border-top-right-radius:4px;margin-left:auto}.message-meta{font-size:11px;color:var(--muted);margin-bottom:4px}.lead-details{padding:18px 15px;border-left:1px solid var(--line);background:#fff}.detail-label{font-size:11px;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.06em;margin:0 0 8px}.requirement{padding:8px 0;border-bottom:1px solid #edf1f6;font-size:13px}.requirement b{display:block;color:#50617a;font-size:11px;text-transform:capitalize}.composer{padding:16px 20px;border-top:1px solid var(--line);background:white}.composer form{display:flex;align-items:flex-end;gap:10px}.composer textarea{min-height:44px;max-height:130px;margin:0}.composer button{height:44px;white-space:nowrap}.composer-help{font-size:12px;color:var(--muted);margin:8px 0 0}.empty-state{padding:44px 24px;text-align:center;color:var(--muted)}.empty-icon{font-size:32px;margin-bottom:8px}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:30px 0 10px}.section-heading p{margin:0;color:var(--muted);font-size:13px}.revision-card{padding:16px;border:1px solid var(--line);border-radius:13px;background:white}.revision-card textarea{min-height:110px}.danger-note{padding:12px;border-radius:10px;background:#f2f6fb;color:#66758a;font-size:12px}
@@ -351,7 +533,7 @@ function shell(title, content) {
   .profile-identity{display:flex;align-items:center;gap:10px;min-width:0}.profile-identity>span{min-width:0}.profile-identity strong,.profile-identity small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.profile-avatar,.profile-avatar-fallback{width:34px;height:34px;flex:0 0 auto;border-radius:50%;object-fit:cover;background:#e8eef6}.profile-avatar-fallback{display:inline-flex;align-items:center;justify-content:center;color:#62748b;font-size:11px;font-weight:800}.profile-header .profile-avatar,.profile-header .profile-avatar-fallback{width:48px;height:48px}.profile-header h2{margin:0 0 3px}.profile-status{display:flex;align-items:center;gap:8px;margin-top:8px;color:var(--muted);font-size:12px}.profile-status form{margin:0}.profile-status button{padding:6px 9px;font-size:12px}
   .triage-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:0 0 18px}.triage-panel{margin:0;padding:16px;min-width:0}.triage-panel .section-heading{margin:0 0 12px}.triage-panel .section-heading h2{margin:0 0 4px}.triage-panel .section-heading p{font-size:12px}.triage-list{display:grid;gap:8px;max-height:310px;overflow:auto}.triage-item{display:block;padding:12px;border:1px solid var(--line);border-radius:12px;background:#fbfcfe;color:inherit;text-decoration:none;min-width:0}.triage-item-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.triage-item-top strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.triage-item time,.wait-time{font-size:11px;color:var(--muted);white-space:nowrap}.count-pill{display:inline-flex;min-width:24px;height:24px;align-items:center;justify-content:center;border-radius:999px;padding:0 7px;background:#e8f1ff;color:var(--blue);font-size:12px;vertical-align:middle}.triage-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}.triage-actions form{margin:0}.triage-actions button,.triage-actions .button{padding:7px 10px;font-size:12px}.triage-empty{padding:24px 12px;border:1px dashed var(--line);border-radius:12px}.waiting-item:hover{background:#f3f7ff;border-color:#cbdcf8}.wait-time{color:#b76508;font-weight:700}
   .menu-upload{max-width:620px;padding:16px;border:1px solid var(--line);border-radius:13px;background:#fbfcfe}.menu-upload input[type=file]{background:white}.menu-upload small{display:block;margin:-3px 0 12px}.rich-menu-preview{display:block;width:min(100%,720px);height:auto;margin:12px 0;border:1px solid var(--line);border-radius:12px;background:#f4f7fb}.menu-draft{margin-top:14px}
-  </style><header><img src="/assets/donnar-tech-logo.png" alt="Donnar.Tech"><strong>Donnar.Tech <span style="opacity:.65;font-weight:450">· LINE Back Office</span></strong></header><main>${content}</main>${title === 'CRM Inbox' ? '<script src="/assets/admin-inbox.js" defer></script>' : ''}</html>`;
+  </style><header><img src="/assets/donnar-tech-logo.png" alt="Donnar.Tech"><strong>Donnar.Tech <span style="opacity:.65;font-weight:450">· LINE Back Office</span></strong></header><main>${content}</main>${title === 'CRM Inbox' ? '<script src="/assets/admin-inbox.js" defer></script>' : ''}${scripts.map((src) => `<script src="${escapeHtml(src)}" defer></script>`).join('')}</html>`;
 }
 
 function loginPage(error = '') {
@@ -359,7 +541,7 @@ function loginPage(error = '') {
 }
 
 async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResult = null } = {}) {
-  const [{ rows: leads }, { rows: revisions }, { rows: menus }, { rows: notifications }, { rows: unreadCountRows }, { rows: waitingLeads }] = await Promise.all([
+  const [{ rows: leads }, { rows: revisions }, { rows: menus }, { rows: notifications }, { rows: unreadCountRows }, { rows: waitingLeads }, { rows: quotationDecisions }] = await Promise.all([
     db.query(`SELECT l.*, c.id AS conversation_id, c.mode, c.current_step, c.line_user_id, u.display_name, u.picture_url, u.profile_synced_at FROM leads l JOIN conversations c ON c.id = l.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id ORDER BY l.updated_at DESC`),
     db.query('SELECT * FROM message_revisions ORDER BY message_key, revision DESC'),
     db.query('SELECT id, line_menu_id, image_uploaded, image_content_type, status, created_at, published_at FROM rich_menu_publications ORDER BY id DESC LIMIT 10'),
@@ -382,6 +564,7 @@ async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResul
       ) sent ON TRUE
       WHERE sent.id IS NULL OR (sent.created_at, sent.id) < (inbound.created_at, inbound.id)
       ORDER BY inbound.created_at ASC, inbound.id ASC`),
+    db.query('SELECT id, number, revision, status, valid_until, buyer_json, total_satang, decided_at FROM quotations WHERE decided_at IS NOT NULL AND decision_read_at IS NULL ORDER BY decided_at DESC LIMIT 10'),
   ]);
 
   const visibleLeads = leads.slice(0, 100);
@@ -410,6 +593,8 @@ async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResul
     messagesByConversation.set(String(selected.conversation_id), rows.reverse());
   }
   const selectedMessages = selected ? (messagesByConversation.get(String(selected.conversation_id)) || []) : [];
+  const today = bangkokToday();
+  const selectedQuotations = selected ? (await db.query('SELECT id, number, revision, status, valid_until, total_satang FROM quotations WHERE conversation_id = $1 ORDER BY created_at DESC, id DESC LIMIT 10', [selected.conversation_id])).rows.map(normalizeQuotation) : [];
   const selectedRequirements = selected?.requirements_json || {};
   const statusLabels = { NEW: 'ลูกค้าใหม่', QUALIFYING: 'กำลังเก็บข้อมูล', QUALIFIED: 'คัดกรองแล้ว', HUMAN_REQUIRED: 'รอพนักงาน' };
   const stepLabels = { serviceType: 'ประเภทงาน', projectSummary: 'รายละเอียดโปรเจกต์', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ', complete: 'เก็บข้อมูลครบแล้ว' };
@@ -438,7 +623,7 @@ async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResul
   const profileStatus = selected && !safeProfilePictureUrl(selected.picture_url)
     ? `<div class="profile-status"><span>${escapeHtml(profileStatusText || (selected.profile_synced_at ? 'LINE ยังไม่มีรูปโปรไฟล์ให้แสดง' : 'ยังไม่พบรูปโปรไฟล์ LINE'))}</span><form method="post" action="/admin/conversations/${selected.conversation_id}/profile/refresh"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ลองโหลดรูปใหม่</button></form></div>`
     : '';
-  const detail = selected ? `<section class="inbox-detail"><div class="detail-head"><div class="profile-identity profile-header">${profileAvatar(selected, 48)}<span><h2>${escapeHtml(selected.display_name || selected.line_user_id)}</h2><div class="muted" style="font-size:13px">LINE UID: ${escapeHtml(selected.line_user_id)}</div><div style="margin-top:9px"><span class="tag">${escapeHtml(statusLabels[selected.status] || selected.status)}</span> <span class="mode-tag ${selected.mode === 'HUMAN' ? 'human' : 'bot'}">${selected.mode === 'HUMAN' ? 'พนักงานดูแล' : 'บอตดูแล'}</span></div>${profileStatus}</span></div><form method="post" action="/admin/conversations/${selected.conversation_id}/mode"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="mode" value="${selected.mode === 'BOT' ? 'HUMAN' : 'BOT'}"><button class="${selected.mode === 'BOT' ? '' : 'secondary'}">${selected.mode === 'BOT' ? 'รับช่วงตอบลูกค้า' : 'ส่งคืนให้บอต'}</button></form></div><div class="detail-grid"><div class="message-history" id="message-history">${messageBubbles || '<div class="empty-state"><div class="empty-icon">💬</div>ยังไม่มีข้อความในบทสนทนา</div>'}</div><aside class="lead-details"><div class="detail-label">รายละเอียดโปรเจกต์</div>${requirementRows}<div class="requirement"><b>ขั้นตอนปัจจุบัน</b>${escapeHtml(stepLabels[selected.current_step] || selected.current_step)}</div><div class="requirement"><b>สถานะ Lead</b>${escapeHtml(statusLabels[selected.status] || selected.status)}</div></aside></div><div class="composer">${selected.mode === 'HUMAN' ? `<form method="post" action="/admin/conversations/${selected.conversation_id}/reply"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><textarea name="text" maxlength="2000" placeholder="พิมพ์ข้อความตอบลูกค้า…" aria-label="ข้อความตอบลูกค้า" required></textarea><button type="submit">ส่งข้อความ <span aria-hidden="true">➤</span></button></form><p class="composer-help">กด “ส่งคืนให้บอต” เมื่อพร้อมให้บอตดูแลบทสนทนาต่อ</p>` : '<div class="danger-note">บอตกำลังดูแลบทสนทนานี้ หากต้องการตอบลูกค้า ให้กด “รับช่วงตอบลูกค้า” ก่อน</div>'}</div></section>` : '<section class="inbox-detail empty-state"><div class="empty-icon">🔎</div><h2>ไม่พบ lead ที่ตรงกับตัวกรอง</h2><p>ลองเปลี่ยนคำค้นหาหรือล้างตัวกรอง</p></section>';
+  const detail = selected ? `<section class="inbox-detail"><div class="detail-head"><div class="profile-identity profile-header">${profileAvatar(selected, 48)}<span><h2>${escapeHtml(selected.display_name || selected.line_user_id)}</h2><div class="muted" style="font-size:13px">LINE UID: ${escapeHtml(selected.line_user_id)}</div><div style="margin-top:9px"><span class="tag">${escapeHtml(statusLabels[selected.status] || selected.status)}</span> <span class="mode-tag ${selected.mode === 'HUMAN' ? 'human' : 'bot'}">${selected.mode === 'HUMAN' ? 'พนักงานดูแล' : 'บอตดูแล'}</span></div>${profileStatus}</span></div><form method="post" action="/admin/conversations/${selected.conversation_id}/mode"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="mode" value="${selected.mode === 'BOT' ? 'HUMAN' : 'BOT'}"><button class="${selected.mode === 'BOT' ? '' : 'secondary'}">${selected.mode === 'BOT' ? 'รับช่วงตอบลูกค้า' : 'ส่งคืนให้บอต'}</button></form></div><div class="detail-grid"><div class="message-history" id="message-history">${messageBubbles || '<div class="empty-state"><div class="empty-icon">💬</div>ยังไม่มีข้อความในบทสนทนา</div>'}</div><aside class="lead-details"><div class="detail-label">รายละเอียดโปรเจกต์</div>${requirementRows}<div class="requirement"><b>ขั้นตอนปัจจุบัน</b>${escapeHtml(stepLabels[selected.current_step] || selected.current_step)}</div><div class="requirement"><b>สถานะ Lead</b>${escapeHtml(statusLabels[selected.status] || selected.status)}</div>${conversationQuotationPanel({ quotations: selectedQuotations, conversationId: selected.conversation_id, csrfToken, today })}</aside></div><div class="composer">${selected.mode === 'HUMAN' ? `<form method="post" action="/admin/conversations/${selected.conversation_id}/reply"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><textarea name="text" maxlength="2000" placeholder="พิมพ์ข้อความตอบลูกค้า…" aria-label="ข้อความตอบลูกค้า" required></textarea><button type="submit">ส่งข้อความ <span aria-hidden="true">➤</span></button></form><p class="composer-help">กด “ส่งคืนให้บอต” เมื่อพร้อมให้บอตดูแลบทสนทนาต่อ</p>` : '<div class="danger-note">บอตกำลังดูแลบทสนทนานี้ หากต้องการตอบลูกค้า ให้กด “รับช่วงตอบลูกค้า” ก่อน</div>'}</div></section>` : '<section class="inbox-detail empty-state"><div class="empty-icon">🔎</div><h2>ไม่พบ lead ที่ตรงกับตัวกรอง</h2><p>ลองเปลี่ยนคำค้นหาหรือล้างตัวกรอง</p></section>';
   const publishedCopy = new Map(revisions.filter((item) => item.status === 'PUBLISHED').map((item) => [item.message_key, item.body]));
   const contentForms = Object.keys(DEFAULT_COPY).map((key) => `<div class="revision-card"><h3>${escapeHtml(key)}</h3><form method="post" action="/admin/content/draft"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="key" value="${escapeHtml(key)}"><textarea name="body" required>${escapeHtml(publishedCopy.get(key) || DEFAULT_COPY[key])}</textarea><button class="secondary">บันทึกฉบับร่าง</button></form></div>`).join('');
   const drafts = revisions.filter((item) => item.status === 'DRAFT').map((item) => `<article class="revision-card"><b>${escapeHtml(item.message_key)} · r${item.revision}</b><p>${escapeHtml(item.body)}</p><form method="post" action="/admin/content/${item.id}/publish"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button>เผยแพร่ฉบับนี้</button></form></article>`).join('') || '<p class="muted">ไม่มีฉบับร่าง</p>';
@@ -452,7 +637,7 @@ async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResul
   ].map((item) => `<div class="metric ${item.tone}"><span>${item.label}</span><strong>${item.count}</strong></div>`).join('');
   const emptyLeads = visibleLeads.length ? '<div class="empty-state"><div class="empty-icon">🔎</div>ไม่พบรายการที่ตรงกับตัวกรอง<br><a href="/admin#inbox">ล้างตัวกรอง</a></div>' : '<div class="empty-state"><div class="empty-icon">📭</div>ยังไม่มีบทสนทนา</div>';
   const triagePanels = `<section class="triage-grid" aria-label="งานที่ต้องติดตาม"><article class="card triage-panel" id="new-leads"><div class="section-heading"><div><div class="eyebrow">NOTIFICATIONS</div><h2>Lead ใหม่ <span class="count-pill">${unreadNotificationCount}</span></h2><p>รายการใหม่ที่ยังไม่ได้อ่าน</p></div></div><div class="triage-list">${notificationRows}</div></article><article class="card triage-panel" id="waiting-replies"><div class="section-heading"><div><div class="eyebrow">FOLLOW UP</div><h2>รอตอบ <span class="count-pill">${waitingLeads.length}</span></h2><p>เรียงจากลูกค้าที่รอนานที่สุด</p></div></div><div class="triage-list">${waitingRows}</div></article></section>`;
-  return shell('CRM Inbox', `<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>กล่องข้อความ</h1><p class="muted">จัดการ lead และบทสนทนาจาก LINE ในหน้าเดียว · ค้นหาใน 100 รายการล่าสุด</p></div><div class="user-tools"><span class="muted">เข้าสู่ระบบเป็น <b>${escapeHtml(staff.username)}</b></span><form method="post" action="/admin/logout"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary">ออกจากระบบ</button></form></div></div><nav class="crm-nav"><a class="active" href="#inbox">กล่องข้อความ</a><a href="#new-leads">Lead ใหม่ (${unreadNotificationCount})</a><a href="#waiting-replies">รอตอบ (${waitingLeads.length})</a><a href="#bot-content">ข้อความบอต</a><a href="#rich-menu">Rich Menu</a></nav><div class="metric-grid">${stats}</div>${triagePanels}<section class="inbox" id="inbox"><aside class="inbox-sidebar"><div class="inbox-heading"><h2>บทสนทนา <span class="muted" style="font-size:13px;font-weight:500">(${filteredLeads.length})</span></h2></div><form method="get" action="/admin" class="filters"><input name="q" type="search" value="${escapeHtml(query.q || '')}" placeholder="ค้นหา UID, ข้อความ หรือรายละเอียด" aria-label="ค้นหา lead"><label for="mode-filter">สถานะการดูแล</label><select id="mode-filter" name="mode"><option value="">ทุกสถานะ</option><option value="BOT"${modeFilter === 'BOT' ? ' selected' : ''}>บอตดูแล</option><option value="HUMAN"${modeFilter === 'HUMAN' ? ' selected' : ''}>รอทีมตอบ</option></select><label for="lead-status-filter">สถานะ lead</label><select id="lead-status-filter" name="status"><option value="">ทั้งหมด</option><option value="NEW"${statusFilter === 'NEW' ? ' selected' : ''}>ใหม่</option><option value="QUALIFYING"${statusFilter === 'QUALIFYING' ? ' selected' : ''}>กำลังเก็บข้อมูล</option><option value="QUALIFIED"${statusFilter === 'QUALIFIED' ? ' selected' : ''}>คัดกรองแล้ว</option><option value="HUMAN_REQUIRED"${statusFilter === 'HUMAN_REQUIRED' ? ' selected' : ''}>ต้องการทีมดูแล</option></select><button type="submit" class="secondary" style="width:100%">ค้นหา / กรอง</button></form><div class="lead-list">${leadRows || emptyLeads}</div></aside>${detail}</section><section id="bot-content"><div class="section-heading"><div><div class="eyebrow">CONTENT</div><h2>ข้อความบอต</h2><p>แก้ข้อความและบันทึกเป็นฉบับร่าง ก่อนกดเผยแพร่</p></div></div><div class="grid">${contentForms}</div><div class="section-heading"><div><h3>ฉบับร่างที่รอเผยแพร่</h3></div></div><div class="grid">${drafts}</div></section>${richMenuPanel}`);
+  return shell('CRM Inbox', `${ADMIN_STYLE}<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>กล่องข้อความ</h1><p class="muted">จัดการ lead และบทสนทนาจาก LINE ในหน้าเดียว · ค้นหาใน 100 รายการล่าสุด</p></div><div class="user-tools"><span class="muted">เข้าสู่ระบบเป็น <b>${escapeHtml(staff.username)}</b></span><form method="post" action="/admin/logout"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary">ออกจากระบบ</button></form></div></div><nav class="crm-nav"><a class="active" href="#inbox">กล่องข้อความ</a><a href="#new-leads">Lead ใหม่ (${unreadNotificationCount})</a><a href="#waiting-replies">รอตอบ (${waitingLeads.length})</a><a href="/admin/quotations">ใบเสนอราคา${quotationDecisions.length ? ` (${quotationDecisions.length})` : ''}</a><a href="#bot-content">ข้อความบอต</a><a href="#rich-menu">Rich Menu</a></nav><div class="metric-grid">${stats}</div>${decisionPanel({ decisions: quotationDecisions.map(normalizeQuotation), today })}${triagePanels}<section class="inbox" id="inbox"><aside class="inbox-sidebar"><div class="inbox-heading"><h2>บทสนทนา <span class="muted" style="font-size:13px;font-weight:500">(${filteredLeads.length})</span></h2></div><form method="get" action="/admin" class="filters"><input name="q" type="search" value="${escapeHtml(query.q || '')}" placeholder="ค้นหา UID, ข้อความ หรือรายละเอียด" aria-label="ค้นหา lead"><label for="mode-filter">สถานะการดูแล</label><select id="mode-filter" name="mode"><option value="">ทุกสถานะ</option><option value="BOT"${modeFilter === 'BOT' ? ' selected' : ''}>บอตดูแล</option><option value="HUMAN"${modeFilter === 'HUMAN' ? ' selected' : ''}>รอทีมตอบ</option></select><label for="lead-status-filter">สถานะ lead</label><select id="lead-status-filter" name="status"><option value="">ทั้งหมด</option><option value="NEW"${statusFilter === 'NEW' ? ' selected' : ''}>ใหม่</option><option value="QUALIFYING"${statusFilter === 'QUALIFYING' ? ' selected' : ''}>กำลังเก็บข้อมูล</option><option value="QUALIFIED"${statusFilter === 'QUALIFIED' ? ' selected' : ''}>คัดกรองแล้ว</option><option value="HUMAN_REQUIRED"${statusFilter === 'HUMAN_REQUIRED' ? ' selected' : ''}>ต้องการทีมดูแล</option></select><button type="submit" class="secondary" style="width:100%">ค้นหา / กรอง</button></form><div class="lead-list">${leadRows || emptyLeads}</div></aside>${detail}</section><section id="bot-content"><div class="section-heading"><div><div class="eyebrow">CONTENT</div><h2>ข้อความบอต</h2><p>แก้ข้อความและบันทึกเป็นฉบับร่าง ก่อนกดเผยแพร่</p></div></div><div class="grid">${contentForms}</div><div class="section-heading"><div><h3>ฉบับร่างที่รอเผยแพร่</h3></div></div><div class="grid">${drafts}</div></section>${richMenuPanel}`);
 }
 
 function readMessage(body) {

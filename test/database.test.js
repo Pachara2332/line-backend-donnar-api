@@ -10,7 +10,7 @@ test('creates the PostgreSQL schema once and migrations are repeatable', async (
     await migrateDatabase(pool);
     const migrations = await pool.query('SELECT version FROM schema_migrations');
     const events = await pool.query('SELECT event_id FROM webhook_events');
-    assert.equal(migrations.rowCount, 3);
+    assert.equal(migrations.rowCount, 4);
     assert.deepEqual(events.rows, []);
   } finally { await close(); }
 });
@@ -22,7 +22,7 @@ test('migration 002 adds LINE profile and durable Rich Menu draft columns once',
     await migrateDatabase(pool);
     const migrations = await pool.query('SELECT version FROM schema_migrations ORDER BY version');
     const columns = await pool.query("SELECT table_name, column_name FROM information_schema.columns WHERE table_name IN ('line_users', 'rich_menu_publications')");
-    assert.deepEqual(migrations.rows.map((row) => row.version), ['001_initial.sql', '002_line_profile_rich_menu_upload.sql', '003_staff_notifications.sql']);
+    assert.deepEqual(migrations.rows.map((row) => row.version), ['001_initial.sql', '002_line_profile_rich_menu_upload.sql', '003_staff_notifications.sql', '004_quotations.sql']);
     assert.deepEqual(columns.rows.filter((row) => ['picture_url', 'profile_synced_at', 'image_data', 'image_content_type'].includes(row.column_name)).map((row) => row.column_name).sort(), ['image_content_type', 'image_data', 'picture_url', 'profile_synced_at']);
     await pool.query("INSERT INTO rich_menu_publications(status) VALUES ('DRAFT')");
     await assert.rejects(pool.query("INSERT INTO rich_menu_publications(status) VALUES ('DRAFT')"));

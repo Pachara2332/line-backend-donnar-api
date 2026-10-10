@@ -76,4 +76,15 @@ function buildIntakeReceivedCard(description) {
   });
 }
 
-module.exports = { buildProjectIntakeCard, buildServicesCard, buildInfoCard, buildHandoffCard, buildIntakeReceivedCard };
+function buildQuotationCard({ label, title, total, validUntil, url }) {
+  return brandBubble({
+    eyebrow: 'Quotation',
+    title: `ใบเสนอราคา ${label}`,
+    accent: BRAND.blue,
+    description: `${title ? `${title}\n` : ''}ยอดรวม ${total} บาท\nยืนราคาถึง ${validUntil}\n\nเปิดดูรายละเอียด ดาวน์โหลด PDF และยืนยันใบเสนอราคาได้จากปุ่มด้านล่าง`,
+    footer: [button('ดูใบเสนอราคา', { type: 'uri', uri: url }, BRAND.blue)],
+    note: 'หากต้องการปรับรายละเอียด ตอบกลับในแชตนี้ได้เลย',
+  });
+}
+
+module.exports = { buildProjectIntakeCard, buildServicesCard, buildInfoCard, buildHandoffCard, buildIntakeReceivedCard, buildQuotationCard };
