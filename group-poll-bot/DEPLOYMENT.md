@@ -20,7 +20,7 @@ Run the service from the repository root with `node group-poll-bot/server.js`. O
 3. After creating the Render service, set its webhook URL to `https://<group-bot-service>.onrender.com/webhooks/line`, verify it, and enable webhook delivery.
 4. Add the new OA as a friend, then invite it into a non-production test group.
 
-The bot handles only text messages from group chats. It ignores ordinary messages, direct messages, and non-text messages. While a poll is open, every group member's exact `1` or `0` message is interpreted as a vote.
+The bot replies only to recognized slash commands in group text messages. It silently records exact `+1` and `-1` messages while a poll is open, and ignores other ordinary messages, direct messages, and non-text messages.
 
 ## Render setup
 
@@ -55,9 +55,10 @@ Render Free services may sleep while idle, so the first webhook after inactivity
 
 ## Commands
 
-- `/ช่วยนับคน <หัวข้อ>` — open a poll, such as `/ช่วยนับคน ไปร้านเหล้า 19 ตุลา 69`.
-- `1` — vote to go.
-- `0` — vote not to go.
+- `/นับคน <หัวข้อ>` — open a poll, such as `/นับคน ไปร้านเหล้าวันที่ 19 ตุลา 69`.
+- `+1` — vote to go.
+- `-1` — vote not to go.
+- `/ยกเลิกโหวต` — remove your own vote.
 - `/สรุปโหวต` — show the current totals.
 - `/ปิดโหวต` — close the poll and show final totals. Any group member can close it.
 

@@ -5,10 +5,11 @@ const SCHEMA = 'group_poll_bot';
 const MAX_TITLE_LENGTH = 200;
 
 function parseCommand(text) {
-  if (text === '1' || text === '0') return { type: 'vote', choice: Number(text) };
   const value = text.trim();
-  const create = value.match(/^\/ช่วยนับคน(?:\s+([\s\S]*))?$/u);
+  if (value === '+1' || value === '-1') return { type: 'vote', choice: value === '+1' ? 1 : 0 };
+  const create = value.match(/^\/นับคน\s*([\s\S]*)$/u);
   if (create) return { type: 'create', title: cleanTitle(create[1] || '') };
+  if (value === '/ยกเลิกโหวต') return { type: 'cancel' };
   if (value === '/สรุปโหวต') return { type: 'summary' };
   if (value === '/ปิดโหวต') return { type: 'close' };
   return null;
@@ -69,12 +70,12 @@ function createPollService({ pool }) {
       const poll = await findOpenPoll(client, source.groupId);
 
       if (command.type === 'create') {
-        if (!command.title) return 'ตัวอย่าง: /ช่วยนับคน ไปร้านเหล้า 19 ตุลา 69';
+        if (!command.title) return 'ตัวอย่าง: /นับคน ไปร้านเหล้า 19 ตุลา 69';
         if (Array.from(command.title).length > MAX_TITLE_LENGTH) return `หัวข้อโหวตยาวเกิน ${MAX_TITLE_LENGTH} ตัวอักษร`;
         if (poll) return `มีกำลังเปิดโหวตอยู่แล้ว: ${poll.title}\nปิดโหวตเดิมก่อนด้วย /ปิดโหวต`;
         const { rows } = await client.query(`INSERT INTO ${SCHEMA}.polls(group_id, title)
           VALUES ($1, $2) RETURNING id, title`, [source.groupId, command.title]);
-        return `เปิดโหวตแล้ว: ${rows[0].title}\nพิมพ์ 1 = ไป, 0 = ไม่ไป\nดูผล: /สรุปโหวต · ปิดโหวต: /ปิดโหวต`;
+        return `เปิดโหวตแล้ว: ${rows[0].title}\nพิมพ์ +1 = ไป, -1 = ไม่ไป\nยกเลิกคะแนนของคุณ: /ยกเลิกโหวต\nดูผล: /สรุปโหวต · ปิดโหวต: /ปิดโหวต`;
       }
 
       if (command.type === 'vote') {
@@ -83,7 +84,15 @@ function createPollService({ pool }) {
           VALUES ($1, $2, $3)
           ON CONFLICT (poll_id, line_user_id) DO UPDATE SET choice = EXCLUDED.choice, updated_at = CURRENT_TIMESTAMP`,
         [poll.id, source.userId, command.choice]);
-        return `รับโหวตแล้ว\n${summaryText(poll, await countVotes(client, poll.id))}`;
+        return null;
+      }
+
+      if (command.type === 'cancel') {
+        if (!poll) return 'ยังไม่มีโพลที่เปิดอยู่ในกลุ่มนี้';
+        const result = await client.query(`DELETE FROM ${SCHEMA}.votes
+          WHERE poll_id = $1 AND line_user_id = $2 RETURNING line_user_id`, [poll.id, source.userId]);
+        if (!result.rowCount) return 'คุณยังไม่มีคะแนนให้ยกเลิก';
+        return `ยกเลิกโหวตของคุณแล้ว\n${summaryText(poll, await countVotes(client, poll.id))}`;
       }
 
       if (command.type === 'summary') {
