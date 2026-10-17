@@ -4,7 +4,7 @@ const express = require('express');
 const { createLineSignatureMiddleware } = require('../middleware/webhookValidation');
 const { LineMessagingClient } = require('../service/lineMessagingClient');
 const { createGroupPollDatabase, initializeGroupPollDatabase } = require('./database');
-const { buildVoteCard } = require('./pollCard');
+const { buildVoteCard, buildPollStatusCard, buildNoticeCard } = require('./pollCard');
 const { createPollService } = require('./pollService');
 
 function loadConfig(env = process.env) {
@@ -86,8 +86,17 @@ function createGroupPollApp({ pool, lineClient, channelSecret }) {
             console.warn('group poll profile lookup failed', diagnostic);
           }
           messages = [buildVoteCard({ ...reply, profile })];
+        } else if (reply.kind === 'poll_open_card' || reply.kind === 'poll_summary_card') {
+          messages = [buildPollStatusCard({
+            pollId: reply.pollId,
+            pollTitle: reply.pollTitle,
+            counts: reply.counts,
+            closed: reply.closed,
+            opening: reply.kind === 'poll_open_card',
+            notice: reply.notice,
+          })];
         } else {
-          messages = [{ type: 'text', text: reply }];
+          messages = [buildNoticeCard(reply)];
         }
         try {
           if (event.replyToken) await lineClient.reply(event.replyToken, messages);

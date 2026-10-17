@@ -84,7 +84,12 @@ function createPollService({ pool }) {
         if (poll) return `มีกำลังเปิดโหวตอยู่แล้ว: ${poll.title}\nปิดโหวตเดิมก่อนด้วย /ปิดโหวต`;
         const { rows } = await client.query(`INSERT INTO ${SCHEMA}.polls(group_id, title)
           VALUES ($1, $2) RETURNING id, title`, [source.groupId, command.title]);
-        return `เปิดโหวตแล้ว: ${rows[0].title}\nพิมพ์ +1 = ไป, -1 = ไม่ไป\nยกเลิกคะแนนของคุณ: /ยกเลิกโหวต\nดูผล: /สรุปโหวต · ปิดโหวต: /ปิดโหวต`;
+        return {
+          kind: 'poll_open_card',
+          pollId: rows[0].id,
+          pollTitle: rows[0].title,
+          counts: { going: 0, notGoing: 0 },
+        };
       }
 
       if (command.type === 'vote') {
@@ -111,13 +116,24 @@ function createPollService({ pool }) {
         const result = await client.query(`DELETE FROM ${SCHEMA}.votes
           WHERE poll_id = $1 AND line_user_id = $2 RETURNING line_user_id`, [poll.id, source.userId]);
         if (!result.rowCount) return 'คุณยังไม่มีคะแนนให้ยกเลิก';
-        return `ยกเลิกโหวตของคุณแล้ว\n${summaryText(poll, await countVotes(client, poll.id))}`;
+        return {
+          kind: 'poll_summary_card',
+          pollId: poll.id,
+          pollTitle: poll.title,
+          counts: await countVotes(client, poll.id),
+          notice: 'ยกเลิกโหวตของคุณแล้ว',
+        };
       }
 
       if (command.type === 'summary') {
         if (!poll) return 'ยังไม่มีโพลที่เปิดอยู่ในกลุ่มนี้';
         if (command.pollId && String(poll.id) !== command.pollId) return 'โพลนี้ปิดไปแล้ว หรือมีโพลใหม่เปิดอยู่';
-        return summaryText(poll, await countVotes(client, poll.id));
+        return {
+          kind: 'poll_summary_card',
+          pollId: poll.id,
+          pollTitle: poll.title,
+          counts: await countVotes(client, poll.id),
+        };
       }
 
       if (command.type === 'close') {
@@ -128,7 +144,13 @@ function createPollService({ pool }) {
           not_going_count = $2, closed_at = CURRENT_TIMESTAMP WHERE id = $3 AND status = 'OPEN'`,
         [counts.going, counts.notGoing, poll.id]);
         await client.query(`DELETE FROM ${SCHEMA}.votes WHERE poll_id = $1`, [poll.id]);
-        return summaryText(poll, counts, true);
+        return {
+          kind: 'poll_summary_card',
+          pollId: poll.id,
+          pollTitle: poll.title,
+          counts,
+          closed: true,
+        };
       }
 
       return null;
