@@ -19,7 +19,7 @@ const { buildQuotationCard } = require('./service/responseCards');
 
 function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
   const app = express();
-  const conversations = createConversationService({ db, lineClient, liffId: config.liffId });
+  const conversations = createConversationService({ db, lineClient, liffId: config.liffId, emailNotificationsEnabled: config.emailNotificationsEnabled, discordNotificationsEnabled: config.discordNotificationsEnabled });
   const seller = config.seller || {};
   const quotations = createQuotationService({ db, seller });
   app.locals.lineClient = lineClient;
@@ -143,18 +143,19 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     }
   });
 
-  app.get('/admin/login', (req, res) => res.type('html').send(loginPage()));
+  app.get('/admin/login', (req, res) => res.type('html').send(loginPage('', req.query.conversation)));
   app.post('/admin/login', express.urlencoded({ extended: false, limit: '10kb' }), rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false }), async (req, res, next) => {
     try {
+    const conversationId = typeof req.body.conversation === 'string' ? positiveId(req.body.conversation) : null;
     const { rows: staffRows } = await db.query('SELECT username, password_hash FROM staff_users WHERE username = $1', [String(req.body.username || '')]);
     const staff = staffRows[0];
-    if (!staff || !verifyPassword(String(req.body.password || ''), staff.password_hash)) return res.status(401).type('html').send(loginPage('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง'));
+    if (!staff || !verifyPassword(String(req.body.password || ''), staff.password_hash)) return res.status(401).type('html').send(loginPage('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง', req.body.conversation));
     const token = randomBytes(32).toString('base64url');
     const csrf = randomBytes(24).toString('base64url');
     await db.query('DELETE FROM staff_sessions WHERE expires_at < NOW()');
     await db.query("INSERT INTO staff_sessions(session_hash, username, csrf_token, expires_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP + INTERVAL '12 hours')", [hashToken(token), staff.username, csrf]);
     res.setHeader('Set-Cookie', sessionCookie(token, config.isProduction));
-    res.redirect(303, '/admin');
+    res.redirect(303, conversationId ? `/admin?conversation=${conversationId}#inbox` : '/admin');
     } catch (error) { next(error); }
   });
 
@@ -465,13 +466,15 @@ function requireStaff(db, config) {
   return async (req, res, next) => {
     req.cookies = parseCookies(req.get('cookie'));
     const token = req.cookies.donnar_session;
-    if (!token) return res.redirect(303, '/admin/login');
+    const conversationId = typeof req.query.conversation === 'string' ? positiveId(req.query.conversation) : null;
+    const loginUrl = conversationId ? `/admin/login?conversation=${conversationId}` : '/admin/login';
+    if (!token) return res.redirect(303, loginUrl);
     let session;
     try {
       const { rows } = await db.query('SELECT s.*, u.username FROM staff_sessions s JOIN staff_users u ON u.username = s.username WHERE s.session_hash = $1 AND s.expires_at > NOW()', [hashToken(token)]);
       session = rows[0];
     } catch (error) { return next(error); }
-    if (!session) return res.redirect(303, '/admin/login');
+    if (!session) return res.redirect(303, loginUrl);
     req.staff = { username: session.username };
     req.csrfToken = session.csrf_token;
     req.sessionHash = hashToken(token);
@@ -536,8 +539,9 @@ function shell(title, content, scripts = []) {
   </style><header><img src="/assets/donnar-tech-logo.png" alt="Donnar.Tech"><strong>Donnar.Tech <span style="opacity:.65;font-weight:450">· LINE Back Office</span></strong></header><main>${content}</main>${title === 'CRM Inbox' ? '<script src="/assets/admin-inbox.js" defer></script>' : ''}${scripts.map((src) => `<script src="${escapeHtml(src)}" defer></script>`).join('')}</html>`;
 }
 
-function loginPage(error = '') {
-  return shell('Staff login', `<section class="card" style="max-width:420px;margin:10vh auto"><h1>เข้าสู่ระบบทีม</h1>${error ? `<p role="alert">${escapeHtml(error)}</p>` : ''}<form method="post" action="/admin/login"><label>ชื่อผู้ใช้<input name="username" autocomplete="username" required></label><label>รหัสผ่าน<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">เข้าสู่ระบบ</button></form></section>`);
+function loginPage(error = '', requestedConversation) {
+  const conversationId = typeof requestedConversation === 'string' ? positiveId(requestedConversation) : null;
+  return shell('Staff login', `<section class="card" style="max-width:420px;margin:10vh auto"><h1>เข้าสู่ระบบทีม</h1>${error ? `<p role="alert">${escapeHtml(error)}</p>` : ''}<form method="post" action="/admin/login">${conversationId ? `<input type="hidden" name="conversation" value="${conversationId}">` : ''}<label>ชื่อผู้ใช้<input name="username" autocomplete="username" required></label><label>รหัสผ่าน<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">เข้าสู่ระบบ</button></form></section>`);
 }
 
 async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResult = null } = {}) {
@@ -587,6 +591,7 @@ async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResul
   const selected = filteredLeads.find((lead) => String(lead.conversation_id) === requestedId)
     || waitingLeads.find((lead) => String(lead.conversation_id) === requestedId)
     || notifications.find((lead) => String(lead.conversation_id) === requestedId)
+    || leads.find((lead) => String(lead.conversation_id) === requestedId)
     || filteredLeads[0];
   if (selected && !messagesByConversation.has(String(selected.conversation_id))) {
     const { rows } = await db.query('SELECT id, direction, body, created_at, send_status, last_error FROM messages WHERE conversation_id = $1 ORDER BY id DESC LIMIT 30', [selected.conversation_id]);

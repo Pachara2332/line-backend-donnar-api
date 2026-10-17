@@ -15,7 +15,7 @@ function eventId(event) {
   return event.webhookEventId || createHash('sha256').update(JSON.stringify(event)).digest('hex');
 }
 
-function createConversationService({ db, lineClient, liffId = '' }) {
+function createConversationService({ db, lineClient, liffId = '', emailNotificationsEnabled = false, discordNotificationsEnabled = false }) {
   const conversationLocks = new Map();
   const profileRefreshes = new Map();
 
@@ -132,7 +132,13 @@ function createConversationService({ db, lineClient, liffId = '' }) {
     if (event.type === 'message') {
       const message = event.message || {};
       incomingText = message.type === 'text' ? message.text : `[${message.type || 'unknown'} message]`;
-      await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id) VALUES ($1, 'IN', $2, $3, $4) ON CONFLICT (event_id, direction) DO NOTHING", [conversation.id, message.type || 'unknown', incomingText, id]);
+      const incoming = await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id) VALUES ($1, 'IN', $2, $3, $4) ON CONFLICT (event_id, direction) DO NOTHING RETURNING id", [conversation.id, message.type || 'unknown', incomingText, id]);
+      if (discordNotificationsEnabled && incoming.rowCount) {
+        await client.query('INSERT INTO line_chat_discord_notifications(event_id, conversation_id, message_id) VALUES ($1, $2, $3) ON CONFLICT (event_id) DO NOTHING', [id, conversation.id, incoming.rows[0].id]);
+      }
+      if (emailNotificationsEnabled && incoming.rowCount) {
+        await client.query('INSERT INTO line_chat_email_notifications(event_id, conversation_id, message_id) VALUES ($1, $2, $3) ON CONFLICT (event_id) DO NOTHING', [id, conversation.id, incoming.rows[0].id]);
+      }
     } else {
       await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id) VALUES ($1, 'IN', 'postback', $2, $3) ON CONFLICT (event_id, direction) DO NOTHING", [conversation.id, JSON.stringify(event.postback || {}), id]);
     }
