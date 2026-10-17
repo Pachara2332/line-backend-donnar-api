@@ -1,7 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { Pool } = require('pg');
-const { createDatabase } = require('../database');
 
 const SCHEMA = 'group_poll_bot';
 
@@ -14,7 +13,7 @@ function createGroupPollDatabase(databaseUrl = process.env.GROUP_BOT_DATABASE_UR
   if (['localhost', '127.0.0.1', '[::1]'].includes(hostname)) {
     return new Pool({ connectionString: databaseUrl, ssl: false, max: 3, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000 });
   }
-  return createDatabase(databaseUrl);
+  return new Pool({ connectionString: databaseUrl, ssl: { rejectUnauthorized: false }, max: 3, connectionTimeoutMillis: 5000, idleTimeoutMillis: 30000 });
 }
 
 async function withGroupPollTransaction(pool, work) {
