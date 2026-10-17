@@ -44,6 +44,25 @@ class LineMessagingClient {
     return { displayName: profile.displayName, pictureUrl: profile.pictureUrl };
   }
 
+  async getGroupMemberProfile(groupId, userId) {
+    if (!this.accessToken) throw new Error('LINE access token is not configured');
+    const path = `/group/${encodeURIComponent(groupId)}/member/${encodeURIComponent(userId)}`;
+    const response = await this.fetchImpl(`${LINE_API}${path}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${this.accessToken}` },
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      const error = new Error(`LINE API returned HTTP ${response.status}`);
+      error.status = response.status;
+      error.retryable = response.status === 429 || response.status >= 500;
+      throw error;
+    }
+    const profile = await response.json();
+    return { displayName: profile.displayName, pictureUrl: profile.pictureUrl };
+  }
+
   reply(replyToken, messages) {
     return this.request('/message/reply', { replyToken, messages: messages.slice(0, 5) });
   }
@@ -73,9 +92,13 @@ class LineMessagingClient {
 }
 
 class FakeLineMessagingClient {
-  constructor() { this.sent = []; this.menus = []; this.profileRequests = []; }
+  constructor() { this.sent = []; this.menus = []; this.profileRequests = []; this.groupProfileRequests = []; }
   async getProfile(userId) {
     this.profileRequests.push(userId);
+    return { displayName: 'Test LINE user', pictureUrl: 'https://example.test/profile.png' };
+  }
+  async getGroupMemberProfile(groupId, userId) {
+    this.groupProfileRequests.push({ groupId, userId });
     return { displayName: 'Test LINE user', pictureUrl: 'https://example.test/profile.png' };
   }
   async reply(replyToken, messages) { this.sent.push({ kind: 'reply', replyToken, messages }); return {}; }

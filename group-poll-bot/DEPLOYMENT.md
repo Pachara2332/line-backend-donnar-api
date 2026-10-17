@@ -20,7 +20,7 @@ Run the service from the repository root with `node group-poll-bot/server.js`. O
 3. After creating the Render service, set its webhook URL to `https://<group-bot-service>.onrender.com/webhooks/line`, verify it, and enable webhook delivery.
 4. Add the new OA as a friend, then invite it into a non-production test group.
 
-The bot replies only to recognized slash commands in group text messages. It silently records exact `+1` and `-1` messages while a poll is open, and ignores other ordinary messages, direct messages, and non-text messages.
+The bot replies to recognized slash commands in group text messages. It records exact `+1` and `-1` messages while a poll is open, and ignores other ordinary messages, direct messages, and non-text messages. Each `+1` produces a card with the member's LINE name and profile image when available, current totals, and buttons to summarize or close the poll. The buttons work only in the group where the poll is open.
 
 ## Render setup
 

@@ -15,6 +15,12 @@ function parseCommand(text) {
   return null;
 }
 
+function parsePostback(data) {
+  const match = /^action=group_poll_(summary|close)&pollId=(\d+)$/.exec(data);
+  if (!match) return null;
+  return { type: match[1], pollId: match[2] };
+}
+
 function cleanTitle(value) {
   return value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
 }
@@ -53,12 +59,15 @@ function createPollService({ pool }) {
   async function processEvent(event) {
     const source = event?.source;
     const message = event?.message;
-    if (event?.type !== 'message' || message?.type !== 'text'
-      || source?.type !== 'group' || typeof source.groupId !== 'string' || !source.groupId
-      || typeof source.userId !== 'string' || !source.userId
-      || typeof message.text !== 'string') return null;
+    if (source?.type !== 'group' || typeof source.groupId !== 'string' || !source.groupId
+      || typeof source.userId !== 'string' || !source.userId) return null;
 
-    const command = parseCommand(message.text);
+    let command = null;
+    if (event?.type === 'message' && message?.type === 'text' && typeof message.text === 'string') {
+      command = parseCommand(message.text);
+    } else if (event?.type === 'postback' && typeof event.postback?.data === 'string') {
+      command = parsePostback(event.postback.data);
+    }
     if (!command) return null;
 
     return withGroupPollTransaction(pool, async (client) => {
@@ -84,6 +93,16 @@ function createPollService({ pool }) {
           VALUES ($1, $2, $3)
           ON CONFLICT (poll_id, line_user_id) DO UPDATE SET choice = EXCLUDED.choice, updated_at = CURRENT_TIMESTAMP`,
         [poll.id, source.userId, command.choice]);
+        if (command.choice === 1) {
+          return {
+            kind: 'poll_vote_card',
+            groupId: source.groupId,
+            userId: source.userId,
+            pollId: poll.id,
+            pollTitle: poll.title,
+            counts: await countVotes(client, poll.id),
+          };
+        }
         return null;
       }
 
@@ -97,11 +116,13 @@ function createPollService({ pool }) {
 
       if (command.type === 'summary') {
         if (!poll) return 'ยังไม่มีโพลที่เปิดอยู่ในกลุ่มนี้';
+        if (command.pollId && String(poll.id) !== command.pollId) return 'โพลนี้ปิดไปแล้ว หรือมีโพลใหม่เปิดอยู่';
         return summaryText(poll, await countVotes(client, poll.id));
       }
 
       if (command.type === 'close') {
         if (!poll) return 'ยังไม่มีโพลที่เปิดอยู่ในกลุ่มนี้';
+        if (command.pollId && String(poll.id) !== command.pollId) return 'โพลนี้ปิดไปแล้ว หรือมีโพลใหม่เปิดอยู่';
         const counts = await countVotes(client, poll.id);
         await client.query(`UPDATE ${SCHEMA}.polls SET status = 'CLOSED', going_count = $1,
           not_going_count = $2, closed_at = CURRENT_TIMESTAMP WHERE id = $3 AND status = 'OPEN'`,
@@ -117,4 +138,4 @@ function createPollService({ pool }) {
   return { processEvent };
 }
 
-module.exports = { createPollService, parseCommand, cleanTitle, eventId, summaryText };
+module.exports = { createPollService, parseCommand, parsePostback, cleanTitle, eventId, summaryText };

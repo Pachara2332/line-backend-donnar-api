@@ -4,6 +4,7 @@ const express = require('express');
 const { createLineSignatureMiddleware } = require('../middleware/webhookValidation');
 const { LineMessagingClient } = require('../service/lineMessagingClient');
 const { createGroupPollDatabase, initializeGroupPollDatabase } = require('./database');
+const { buildVoteCard } = require('./pollCard');
 const { createPollService } = require('./pollService');
 
 function loadConfig(env = process.env) {
@@ -24,12 +25,18 @@ function isValidWebhookPayload(payload) {
     if (!event || typeof event !== 'object' || Array.isArray(event) || typeof event.type !== 'string' || !event.type) return false;
     if (event.source !== undefined && (!event.source || typeof event.source !== 'object' || Array.isArray(event.source))) return false;
     if (event.source?.userId !== undefined && (typeof event.source.userId !== 'string' || !event.source.userId)) return false;
+    if (event.replyToken !== undefined && typeof event.replyToken !== 'string') return false;
+    if (event.type === 'postback') {
+      if (!event.source || !event.postback || typeof event.postback !== 'object' || Array.isArray(event.postback)
+        || typeof event.postback.data !== 'string') return false;
+      if (event.source.type === 'group' && (typeof event.source.groupId !== 'string' || !event.source.groupId)) return false;
+      return true;
+    }
     if (event.type !== 'message') return true;
     if (!event.source || !event.message || typeof event.message !== 'object' || Array.isArray(event.message)
       || typeof event.message.type !== 'string' || !event.message.type) return false;
     if (event.source.type === 'group' && (typeof event.source.groupId !== 'string' || !event.source.groupId)) return false;
     if (event.message.type === 'text' && typeof event.message.text !== 'string') return false;
-    if (event.replyToken !== undefined && typeof event.replyToken !== 'string') return false;
     return true;
   });
 }
@@ -68,10 +75,23 @@ function createGroupPollApp({ pool, lineClient, channelSecret }) {
         return res.status(500).json({ error: 'Webhook event processing failed' });
       }
       if (reply) {
-        const message = [{ type: 'text', text: reply }];
+        let messages;
+        if (reply.kind === 'poll_vote_card') {
+          let profile = null;
+          try {
+            profile = await lineClient.getGroupMemberProfile(reply.groupId, reply.userId);
+          } catch (error) {
+            const diagnostic = {};
+            if (Number.isInteger(error.status)) diagnostic.status = error.status;
+            console.warn('group poll profile lookup failed', diagnostic);
+          }
+          messages = [buildVoteCard({ ...reply, profile })];
+        } else {
+          messages = [{ type: 'text', text: reply }];
+        }
         try {
-          if (event.replyToken) await lineClient.reply(event.replyToken, message);
-          else await lineClient.push(event.source.groupId, message);
+          if (event.replyToken) await lineClient.reply(event.replyToken, messages);
+          else await lineClient.push(event.source.groupId, messages);
         } catch (error) {
           const diagnostic = {};
           if (Number.isInteger(error.status)) diagnostic.status = error.status;
