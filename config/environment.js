@@ -15,6 +15,7 @@ function loadConfig(env = process.env) {
   if (env.LIFF_ID && !/^\d+-[A-Za-z0-9]+$/.test(env.LIFF_ID)) throw new Error('LIFF_ID must look like 1234567890-AbCdEfGh');
   if (env.SELLER_TAX_ID && !/^\d{13}$/.test(env.SELLER_TAX_ID)) throw new Error('SELLER_TAX_ID must be 13 digits');
   if (env.SELLER_BRANCH_CODE && !/^\d{5}$/.test(env.SELLER_BRANCH_CODE)) throw new Error('SELLER_BRANCH_CODE must be 5 digits');
+  if (env.MESSENGER_GRAPH_API_VERSION && !/^v\d+\.\d+$/.test(env.MESSENGER_GRAPH_API_VERSION)) throw new Error('MESSENGER_GRAPH_API_VERSION must look like v26.0');
   const port = Number(env.PORT || 3000);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be an integer from 1 to 65535');
 
@@ -25,6 +26,12 @@ function loadConfig(env = process.env) {
     databaseUrl: env.DATABASE_URL || '',
     lineChannelSecret: env.LINE_CHANNEL_SECRET || '',
     lineAccessToken: env.LINE_CHANNEL_ACCESS_TOKEN || '',
+    messengerAppSecret: env.MESSENGER_APP_SECRET || '',
+    messengerWebhookVerifyToken: env.MESSENGER_WEBHOOK_VERIFY_TOKEN || '',
+    messengerPageAccessToken: env.MESSENGER_PAGE_ACCESS_TOKEN || '',
+    messengerPageId: env.MESSENGER_PAGE_ID || '',
+    messengerGraphApiVersion: env.MESSENGER_GRAPH_API_VERSION || '',
+    messengerEnabled: Boolean(env.MESSENGER_APP_SECRET && env.MESSENGER_WEBHOOK_VERIFY_TOKEN && env.MESSENGER_PAGE_ACCESS_TOKEN && env.MESSENGER_PAGE_ID && env.MESSENGER_GRAPH_API_VERSION),
     resendApiKey: env.RESEND_API_KEY || '',
     resendFromEmail: env.RESEND_FROM_EMAIL || '',
     chatNotificationEmail: env.CHAT_NOTIFICATION_EMAIL || 'mrtgamer76@gmail.com',

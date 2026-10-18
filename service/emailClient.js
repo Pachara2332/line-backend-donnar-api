@@ -41,26 +41,28 @@ function createEmailClient({ apiKey, fromEmail, fetchImpl = globalThis.fetch, ti
   return { send };
 }
 
-function buildChatNotificationEmail({ baseUrl, conversationId, displayName, lineUserId, messageType, body, createdAt }) {
+function buildChatNotificationEmail({ baseUrl, conversationId, channel = 'LINE', displayName, channelUserId, lineUserId, messageType, body, createdAt }) {
   const id = Number(conversationId);
   if (!Number.isSafeInteger(id) || id <= 0 || !/^\d+$/.test(String(conversationId))) throw emailError('email_invalid_content', false);
   let url;
   try { url = new URL(baseUrl); }
   catch { throw emailError('email_invalid_content', false); }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw emailError('email_invalid_content', false);
-  url.pathname = '/admin';
-  url.search = `?conversation=${id}`;
+  url.pathname = '/admin/inbox';
+  const userId = channelUserId || lineUserId || '';
+  url.search = `?channel=${encodeURIComponent(channel)}&conversation=${id}`;
   url.hash = 'inbox';
   const crmUrl = url.toString();
-  const sender = String(displayName || lineUserId || 'LINE customer');
+  const platform = channel === 'FACEBOOK' ? 'Facebook Messenger' : 'LINE';
+  const sender = String(displayName || userId || `${platform} customer`);
   const labels = { image: '[Image message]', video: '[Video message]', audio: '[Audio message]', file: '[File message]', sticker: '[Sticker message]', location: '[Location message]' };
   const preview = messageType === 'text' ? Array.from(String(body || '')).slice(0, 300).join('') : (Object.hasOwn(labels, messageType) ? labels[messageType] : '[Non-text message]');
   const date = new Date(createdAt);
   const receivedAt = Number.isNaN(date.getTime()) ? 'Unknown' : date.toISOString();
   return {
-    subject: 'New LINE message — Donnar.Tech',
-    text: `New LINE message\nFrom: ${sender}\nLINE user ID: ${lineUserId || ''}\nReceived: ${receivedAt}\n\n${preview}\n\nOpen CRM conversation: ${crmUrl}`,
-    html: `<h1>New LINE message</h1><p>From: ${escapeHtml(sender)}</p><p>LINE user ID: ${escapeHtml(lineUserId || '')}</p><p>Received: ${escapeHtml(receivedAt)}</p><p style="white-space:pre-wrap">${escapeHtml(preview)}</p><p><a href="${escapeHtml(crmUrl)}">Open CRM conversation</a></p>`,
+    subject: `New ${platform} message — Donnar.Tech`,
+    text: `New ${platform} message\nFrom: ${sender}\n${platform} user ID: ${userId}\nReceived: ${receivedAt}\n\n${preview}\n\nOpen CRM conversation: ${crmUrl}`,
+    html: `<h1>New ${escapeHtml(platform)} message</h1><p>From: ${escapeHtml(sender)}</p><p>${escapeHtml(platform)} user ID: ${escapeHtml(userId)}</p><p>Received: ${escapeHtml(receivedAt)}</p><p style="white-space:pre-wrap">${escapeHtml(preview)}</p><p><a href="${escapeHtml(crmUrl)}">Open CRM conversation</a></p>`,
   };
 }
 

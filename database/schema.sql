@@ -15,13 +15,25 @@ CREATE TABLE IF NOT EXISTS line_users (
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS messenger_users (
+  messenger_user_id TEXT PRIMARY KEY,
+  display_name TEXT,
+  picture_url TEXT,
+  profile_synced_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS conversations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  line_user_id TEXT NOT NULL UNIQUE REFERENCES line_users(line_user_id),
+  channel TEXT NOT NULL DEFAULT 'LINE' CHECK (channel IN ('LINE', 'FACEBOOK')),
+  line_user_id TEXT UNIQUE REFERENCES line_users(line_user_id),
+  messenger_user_id TEXT UNIQUE REFERENCES messenger_users(messenger_user_id),
   mode TEXT NOT NULL DEFAULT 'BOT' CHECK (mode IN ('BOT', 'HUMAN')),
   current_step TEXT NOT NULL DEFAULT 'serviceType',
   handoff_reason TEXT,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK ((channel = 'LINE' AND line_user_id IS NOT NULL AND messenger_user_id IS NULL) OR (channel = 'FACEBOOK' AND line_user_id IS NULL AND messenger_user_id IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -36,6 +48,7 @@ CREATE TABLE IF NOT EXISTS messages (
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   allow_human_mode INTEGER NOT NULL DEFAULT 0 CHECK (allow_human_mode IN (0, 1)),
+  provider_timestamp TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -83,6 +96,17 @@ CREATE TABLE IF NOT EXISTS rich_menu_publications (
   published_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS messenger_menu_publications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  menu_json TEXT NOT NULL,
+  page_menu_id TEXT,
+  status TEXT NOT NULL CHECK (status IN ('DRAFT', 'CREATING', 'PUBLISHED', 'FAILED', 'REPLACED')),
+  last_error TEXT,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  published_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS staff_users (
   username TEXT PRIMARY KEY,
   password_hash TEXT NOT NULL,
@@ -99,4 +123,7 @@ CREATE TABLE IF NOT EXISTS staff_sessions (
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_leads_updated ON leads(updated_at);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_conversations_channel_updated ON conversations(channel, updated_at DESC, id DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rich_menu_single_draft ON rich_menu_publications(status) WHERE status = 'DRAFT';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messenger_menu_single_draft ON messenger_menu_publications(status) WHERE status = 'DRAFT';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messenger_menu_single_creation ON messenger_menu_publications(status) WHERE status = 'CREATING';

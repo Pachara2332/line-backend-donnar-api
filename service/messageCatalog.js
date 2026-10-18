@@ -11,10 +11,11 @@ const DEFAULT_COPY = {
   fallback: 'ขอบคุณที่ส่งข้อความมาครับ เลือกดูบริการ เริ่มปรึกษาโปรเจกต์ หรือพิมพ์ “คุยกับคน” เพื่อให้ทีมรับช่วงต่อได้เลยครับ',
 };
 
-async function getCopy(db, key) {
+async function getCopy(db, key, channel = 'LINE') {
   const { rows } = await db.query("SELECT body FROM message_revisions WHERE message_key = $1 AND status = 'PUBLISHED' ORDER BY revision DESC LIMIT 1", [key]);
   const row = rows[0];
-  return row?.body || DEFAULT_COPY[key] || DEFAULT_COPY.fallback;
+  const body = row?.body || DEFAULT_COPY[key] || DEFAULT_COPY.fallback;
+  return channel === 'FACEBOOK' ? body.replace(/LINE Official Account/g, 'Facebook Page').replace(/LINE OA/g, 'Facebook Page').replace(/แชต LINE นี้/g, 'แชต Facebook นี้').replace(/แชต LINE/g, 'แชต Facebook').replace(/ใน LINE/g, 'ใน Facebook') : body;
 }
 
 module.exports = { DEFAULT_COPY, getCopy };

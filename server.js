@@ -6,6 +6,7 @@ const { createEmailClient } = require('./service/emailClient');
 const { createEmailNotificationWorker } = require('./service/emailNotificationWorker');
 const { createDiscordBotClient } = require('./service/discordBotClient');
 const { createDiscordNotificationWorker } = require('./service/discordNotificationWorker');
+const { createMessengerMessagingClient } = require('./service/messengerMessagingClient');
 const { buildApp } = require('./app');
 
 const config = loadConfig();
@@ -13,6 +14,9 @@ const db = createDatabase(config.databaseUrl);
 const lineClient = config.fakeLineMode
   ? new FakeLineMessagingClient()
   : new LineMessagingClient({ accessToken: config.lineAccessToken });
+const messengerClient = config.messengerEnabled
+  ? createMessengerMessagingClient({ accessToken: config.messengerPageAccessToken, pageId: config.messengerPageId, graphApiVersion: config.messengerGraphApiVersion })
+  : null;
 async function main() {
   let emailWorker;
   let discordWorker;
@@ -26,11 +30,11 @@ async function main() {
       const discordClient = createDiscordBotClient({ botToken: config.discordBotToken, channelId: config.discordChannelId });
       discordWorker = createDiscordNotificationWorker({ db, discordClient, publicBaseUrl: config.publicBaseUrl });
     }
-    const app = buildApp({ db, lineClient, config });
+    const app = buildApp({ db, lineClient, messengerClient, config });
     const server = app.listen(config.port, () => {
       emailWorker?.start();
       discordWorker?.start();
-      console.info(`Donnar LINE backend listening on ${config.port} (${config.nodeEnv})`);
+      console.info(`Donnar backend listening on ${config.port} (${config.nodeEnv})`);
     });
     let shuttingDown = false;
     async function shutdown() {

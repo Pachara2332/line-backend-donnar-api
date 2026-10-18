@@ -7,6 +7,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const history = document.getElementById('message-history');
   const leadList = inbox.querySelector('.lead-list');
   let selectedConversation = inbox.dataset.selectedConversation || '';
+  const channel = inbox.dataset.channel === 'FACEBOOK' ? 'FACEBOOK' : 'LINE';
   const pendingUpdates = new Set();
   const retryingUpdates = new Set();
   let updateTimer = null;
@@ -15,7 +16,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (history) history.scrollTop = history.scrollHeight;
 
   const statusLabels = { NEW: 'ลูกค้าใหม่', QUALIFYING: 'กำลังเก็บข้อมูล', QUALIFIED: 'คัดกรองแล้ว', HUMAN_REQUIRED: 'รอพนักงาน' };
-  const stepLabels = { serviceType: 'ประเภทงาน', projectSummary: 'รายละเอียดโปรเจกต์', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ', complete: 'เก็บข้อมูลครบแล้ว' };
+  const stepLabels = { serviceType: 'ประเภทงาน', projectSummary: 'เป้าหมาย/ปัญหา', features: 'ฟีเจอร์หลัก', audience: 'ผู้ใช้และแพลตฟอร์ม', timeline: 'ระยะเวลา', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ', complete: 'เก็บข้อมูลครบแล้ว' };
 
   function formatDate(value) {
     const date = new Date(value);
@@ -42,14 +43,14 @@ document.addEventListener('DOMContentLoaded', () => {
       avatar = document.createElement('span');
       avatar.className = 'profile-avatar-fallback';
       avatar.setAttribute('role', 'img');
-      avatar.setAttribute('aria-label', 'ไม่มีรูปโปรไฟล์ LINE');
-      avatar.textContent = 'LINE';
+      avatar.setAttribute('aria-label', `ไม่มีรูปโปรไฟล์ ${conversation.channel === 'FACEBOOK' ? 'Facebook' : 'LINE'}`);
+      avatar.textContent = conversation.channel === 'FACEBOOK' ? 'FB' : 'LINE';
     }
     const text = document.createElement('span');
     const name = document.createElement('strong');
     name.textContent = conversation.displayName || conversation.lineUserId;
     const userId = document.createElement('small');
-    userId.textContent = conversation.lineUserId;
+    userId.textContent = conversation.channelUserId || conversation.lineUserId;
     text.append(name, userId);
     identity.append(avatar, text);
     return identity;
@@ -107,7 +108,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (mode && conversation.mode !== mode) return false;
     if (status && conversation.status !== status) return false;
     if (!search) return true;
-    const values = [conversation.displayName, conversation.lineUserId, conversation.status, conversation.currentStep, summary, ...Object.values(conversation.requirements || {})];
+    const values = [conversation.displayName, conversation.channelUserId, conversation.lineUserId, conversation.status, conversation.currentStep, summary, ...Object.values(conversation.requirements || {})];
     return values.join(' ').toLocaleLowerCase().includes(search);
   }
 
@@ -140,14 +141,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const modeForm = detail.querySelector('.detail-head form');
     const modeInput = modeForm?.querySelector('[name="mode"]');
     const modeButton = modeForm?.querySelector('button');
-    const previousMode = modeInput?.value === 'BOT' ? 'HUMAN' : 'BOT';
-    const modeChanged = modeInput && previousMode !== conversation.mode;
     if (modeInput) modeInput.value = conversation.mode === 'BOT' ? 'HUMAN' : 'BOT';
     if (modeButton) {
       modeButton.className = conversation.mode === 'BOT' ? '' : 'secondary';
       modeButton.textContent = conversation.mode === 'BOT' ? 'รับช่วงตอบลูกค้า' : 'ส่งคืนให้บอต';
     }
-    const requirementLabels = { serviceType: 'ประเภทงาน', projectSummary: 'รายละเอียดโปรเจกต์', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ' };
+    const requirementLabels = { serviceType: 'ประเภทงาน', projectSummary: 'เป้าหมาย/ปัญหา', features: 'ฟีเจอร์หลัก', audience: 'ผู้ใช้และแพลตฟอร์ม', timeline: 'ระยะเวลา', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ' };
     const requirements = detail.querySelector('#conversation-requirements');
     if (requirements) {
       const entries = Object.entries(conversation.requirements || {});
@@ -173,9 +172,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const leadStatus = detail.querySelector('#conversation-lead-status');
     if (leadStatus) leadStatus.lastChild.textContent = statusLabels[conversation.status] || conversation.status;
     const composer = detail.querySelector('.composer');
-    if (!composer || !modeChanged || !modeInput?.form) return;
+    if (!composer || !modeInput?.form) return;
     const csrfToken = modeForm.querySelector('[name="_csrf"]')?.value;
-    if (conversation.mode === 'HUMAN') {
+    if (conversation.mode === 'HUMAN' && conversation.sendEligible) {
       const form = document.createElement('form');
       form.method = 'post';
       form.action = `/admin/conversations/${conversation.id}/reply`;
@@ -183,6 +182,10 @@ document.addEventListener('DOMContentLoaded', () => {
       csrf.type = 'hidden';
       csrf.name = '_csrf';
       csrf.value = csrfToken || '';
+      const channelInput = document.createElement('input');
+      channelInput.type = 'hidden';
+      channelInput.name = 'channel';
+      channelInput.value = channel;
       const textarea = document.createElement('textarea');
       textarea.name = 'text';
       textarea.maxLength = 2000;
@@ -196,11 +199,16 @@ document.addEventListener('DOMContentLoaded', () => {
       icon.setAttribute('aria-hidden', 'true');
       icon.textContent = '➤';
       button.append(icon);
-      form.append(csrf, textarea, button);
+      form.append(csrf, channelInput, textarea, button);
       const help = document.createElement('p');
       help.className = 'composer-help';
       help.textContent = 'กด “ส่งคืนให้บอต” เมื่อพร้อมให้บอตดูแลบทสนทนาต่อ';
       composer.replaceChildren(form, help);
+    } else if (conversation.mode === 'HUMAN') {
+      const note = document.createElement('div');
+      note.className = 'danger-note';
+      note.textContent = `ส่งข้อความไม่ได้เพราะพ้นช่วงเวลาตอบกลับ 24 ชั่วโมงแล้ว${conversation.latestCustomerMessageAt ? ` · ข้อความล่าสุด ${formatDate(conversation.latestCustomerMessageAt)}` : ''} ลูกค้าต้องส่งข้อความหาเพจก่อน`;
+      composer.replaceChildren(note);
     } else {
       const note = document.createElement('div');
       note.className = 'danger-note';
@@ -223,10 +231,10 @@ document.addEventListener('DOMContentLoaded', () => {
       inbox.parentNode.insertBefore(notice, inbox);
     }
     const text = document.createElement('span');
-    text.textContent = `มีข้อความใหม่จาก ${conversation.displayName || conversation.lineUserId}`;
+    text.textContent = `มีข้อความใหม่จาก ${conversation.displayName || conversation.channelUserId || conversation.lineUserId}`;
     const link = document.createElement('a');
     link.className = 'button secondary';
-    link.href = `/admin/inbox?conversation=${encodeURIComponent(conversation.id)}`;
+    link.href = `/admin/inbox?channel=${channel}&conversation=${encodeURIComponent(conversation.id)}`;
     link.textContent = 'เปิดบทสนทนา';
     notice.replaceChildren(text, link);
   }
@@ -250,9 +258,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function refreshConversation(conversationId) {
     const includeMessages = String(conversationId) === selectedConversation ? '1' : '0';
-    const response = await fetch(`/admin/inbox/updates/${encodeURIComponent(conversationId)}?messages=${includeMessages}`, { headers: { Accept: 'application/json' }, cache: 'no-store' });
+    const response = await fetch(`/admin/inbox/updates/${encodeURIComponent(conversationId)}?channel=${channel}&messages=${includeMessages}`, { headers: { Accept: 'application/json' }, cache: 'no-store' });
     if (response.status === 401 || response.status === 403) {
       window.location.reload();
+      return;
+    }
+    if (response.status === 204) {
+      retryingUpdates.delete(String(conversationId));
       return;
     }
     if (!response.ok) throw new Error('Inbox update failed');
@@ -281,7 +293,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const cursor = inbox.dataset.inboxEventId || '0';
-  const events = new EventSource(`/admin/inbox/events?after=${encodeURIComponent(cursor)}`);
+  const events = new EventSource(`/admin/inbox/events?channel=${channel}&after=${encodeURIComponent(cursor)}`);
   events.addEventListener('inbox-update', (event) => {
     try { queueUpdate(JSON.parse(event.data).conversationId); } catch {}
   });
