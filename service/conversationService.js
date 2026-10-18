@@ -412,6 +412,10 @@ function createConversationService({ db, lineClient, messengerClient = null, mes
         return { processed: true };
       }
       const skipped = SKIP.has(command.toLowerCase());
+      if (step === 'projectSummary' && skipped) {
+        await queueQuestion(step, 'ข้อนี้จำเป็นครับ กรุณาเล่าเป้าหมายหรือปัญหาที่อยากแก้');
+        return { processed: true };
+      }
       if (value && !skipped) requirements[step] = value;
       else if (!skipped && step !== 'projectSummary') {
         await queueQuestion(step);

@@ -76,16 +76,16 @@ function buildApp({ db, lineClient, messengerClient = null, config, verifyLiffTo
 
   async function pushQuotationCard(quotation) {
     const { rows } = await db.query('SELECT id, channel, line_user_id, messenger_user_id FROM conversations WHERE id = $1', [quotation.conversation_id]);
-    if (!rows[0]) return false;
+    if (!rows[0]) return { delivered: false, windowExpired: false };
     const card = rows[0].channel === 'FACEBOOK'
       ? buildMessengerQuotation({ label: quotationLabel(quotation), title: quotation.title, total: formatMoney(quotation.total_satang), validUntil: formatThaiDate(quotation.valid_until), url: quotationLink(quotation.public_token) })
       : buildQuotationCard({ label: quotationLabel(quotation), title: quotation.title, total: formatMoney(quotation.total_satang), validUntil: formatThaiDate(quotation.valid_until), url: quotationLink(quotation.public_token) });
     try {
       const result = await deliverPush(rows[0], card);
-      return result?.outcome === 'window_expired' ? false : true;
+      return { delivered: result?.outcome !== 'window_expired', windowExpired: result?.outcome === 'window_expired' };
     } catch (error) {
       console.error('quotation card delivery failed', { quotationId: quotation.id, status: error.status || null });
-      return false;
+      return { delivered: false, windowExpired: false };
     }
   }
 
@@ -588,8 +588,16 @@ function buildApp({ db, lineClient, messengerClient = null, config, verifyLiffTo
       }
       if (issued.outcome !== 'issued') return res.redirect(303, `/admin/quotations/${id}`);
       const { quotation } = await quotations.load(id);
-      const delivered = await pushQuotationCard(quotation);
-      return res.redirect(303, `/admin/quotations/${id}?flash=${delivered ? 'sent' : 'push-failed'}`);
+      const delivery = await pushQuotationCard(quotation);
+      if (delivery.windowExpired) {
+        const reverted = await quotations.returnToDraftAfterMessengerWindowExpiry(id, req.staff.username);
+        if (reverted) {
+          const reloaded = await quotations.load(id);
+          const { values } = parseQuotationForm(req.body);
+          return renderEditor(res, req, reloaded, { status: 409, model: formModel(values, req.body), errors: ['ส่งใบเสนอราคาใน Messenger ไม่ได้เพราะพ้นช่วงเวลาตอบกลับ 24 ชั่วโมงแล้ว ฉบับร่างถูกบันทึกไว้ ให้ลูกค้าส่งข้อความหาเพจก่อน'] });
+        }
+      }
+      return res.redirect(303, `/admin/quotations/${id}?flash=${delivery.delivered ? 'sent' : 'push-failed'}`);
     } catch (error) { return next(error); }
   });
   app.get('/admin/quotations/:id/pdf', loadStaffQuotation, async (req, res, next) => {
@@ -599,9 +607,9 @@ function buildApp({ db, lineClient, messengerClient = null, config, verifyLiffTo
     try {
       const { quotation } = req.quotation;
       if (effectiveStatus(quotation, bangkokToday()) !== 'SENT') return res.status(409).send('ส่งการ์ดได้เฉพาะใบเสนอราคาที่รอลูกค้าตอบรับ');
-      const delivered = await pushQuotationCard(quotation);
-      await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'quotation.card_resent', 'quotation', String(quotation.id), JSON.stringify({ delivered })]);
-      return res.redirect(303, `/admin/quotations/${quotation.id}?flash=${delivered ? 'resent' : 'push-failed'}`);
+      const delivery = await pushQuotationCard(quotation);
+      await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'quotation.card_resent', 'quotation', String(quotation.id), JSON.stringify({ delivered: delivery.delivered })]);
+      return res.redirect(303, `/admin/quotations/${quotation.id}?flash=${delivery.delivered ? 'resent' : 'push-failed'}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/quotations/:id/revise', loadStaffQuotation, requireCsrf, async (req, res, next) => {

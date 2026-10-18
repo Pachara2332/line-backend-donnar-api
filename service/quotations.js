@@ -290,6 +290,19 @@ function createQuotationService({ db, seller }) {
     });
   }
 
+  async function returnToDraftAfterMessengerWindowExpiry(id, username) {
+    return withTransaction(db, async (client) => {
+      const { rows } = await client.query('SELECT id, supersedes_id, status FROM quotations WHERE id = $1 FOR UPDATE', [id]);
+      if (!rows[0] || rows[0].status !== 'SENT') return false;
+      await client.query("UPDATE quotations SET status = 'DRAFT', seller_json = NULL, issue_date = NULL, valid_until = NULL, public_token = NULL, sent_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1", [id]);
+      if (rows[0].supersedes_id) {
+        await client.query("UPDATE quotations SET status = CASE WHEN decided_at IS NULL THEN 'SENT' ELSE 'REJECTED' END, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'SUPERSEDED'", [rows[0].supersedes_id]);
+      }
+      await audit(client, username, 'quotation.returned_to_draft', id, { reason: 'messenger_window_expired' });
+      return true;
+    });
+  }
+
   async function revise(id, username) {
     return withTransaction(db, async (client) => {
       const { rows } = await client.query('SELECT * FROM quotations WHERE id = $1 FOR UPDATE', [id]);
@@ -344,7 +357,7 @@ function createQuotationService({ db, seller }) {
   }
 
   return {
-    createDraft, saveDraft, issue, revise, cancel, deleteDraft, decide, markDecisionRead,
+    createDraft, saveDraft, issue, returnToDraftAfterMessengerWindowExpiry, revise, cancel, deleteDraft, decide, markDecisionRead,
     load: (id) => loadQuotation(db, 'id = $1', [id]),
     loadByToken: (token) => loadQuotation(db, 'public_token = $1', [token]),
     vatRateBp,
