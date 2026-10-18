@@ -15,9 +15,13 @@ function eventId(event) {
   return event.webhookEventId || createHash('sha256').update(JSON.stringify(event)).digest('hex');
 }
 
-function createConversationService({ db, lineClient, liffId = '', emailNotificationsEnabled = false, discordNotificationsEnabled = false }) {
+function createConversationService({ db, lineClient, liffId = '', emailNotificationsEnabled = false, discordNotificationsEnabled = false, onInboxUpdate = null }) {
   const conversationLocks = new Map();
   const profileRefreshes = new Map();
+  function notifyInboxUpdate(conversationId) {
+    if (typeof onInboxUpdate !== 'function') return;
+    try { onInboxUpdate(conversationId); } catch {}
+  }
 
   async function refreshLineProfile(userId, { force = false } = {}) {
     if (!lineClient.getProfile) return;
@@ -215,10 +219,20 @@ function createConversationService({ db, lineClient, liffId = '', emailNotificat
       const dedupe = await client.query('INSERT INTO webhook_events(event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING RETURNING event_id', [id, event?.type || 'unknown']);
       if (!dedupe.rowCount) return false;
       result = await processEventState(client, event, id);
+      if (typeof onInboxUpdate === 'function' && ['follow', 'message', 'postback'].includes(event?.type) && event?.source?.userId) {
+        const { rows } = await client.query(`SELECT c.id, (SELECT m.id FROM messages m WHERE m.conversation_id = c.id AND m.event_id = $2 AND m.direction = 'IN' LIMIT 1) AS message_id
+          FROM conversations c WHERE c.line_user_id = $1`, [event.source.userId, id]);
+        if (rows[0]) result = { ...result, inboxUpdate: { conversationId: Number(rows[0].id), messageId: rows[0].message_id ? Number(rows[0].message_id) : null } };
+      }
       return true;
     });
+    if (inserted && result?.inboxUpdate) notifyInboxUpdate(result.inboxUpdate.conversationId);
     const userId = event?.source?.userId;
-    if (userId) await deliverPending(id, userId);
+    try {
+      if (userId) await deliverPending(id, userId);
+    } finally {
+      if (inserted && result?.inboxUpdate) notifyInboxUpdate(result.inboxUpdate.conversationId);
+    }
     if (inserted && userId && ['follow', 'message', 'postback'].includes(event?.type)) {
       await refreshLineProfile(userId, { force: event.type === 'follow' });
     }
@@ -242,7 +256,7 @@ function createConversationService({ db, lineClient, liffId = '', emailNotificat
     const id = `liff:${submissionId}`;
     const saved = await withTransaction(db, async (client) => {
       const dedupe = await client.query('INSERT INTO webhook_events(event_id, event_type) VALUES ($1, $2) ON CONFLICT (event_id) DO NOTHING RETURNING event_id', [id, 'liff_intake']);
-      if (!dedupe.rowCount) return false;
+      if (!dedupe.rowCount) return null;
       await client.query('INSERT INTO line_users(line_user_id) VALUES ($1) ON CONFLICT (line_user_id) DO NOTHING', [userId]);
       await client.query('INSERT INTO conversations(line_user_id) VALUES ($1) ON CONFLICT (line_user_id) DO NOTHING', [userId]);
       const { rows } = await client.query('SELECT * FROM conversations WHERE line_user_id = $1', [userId]);
@@ -259,13 +273,16 @@ function createConversationService({ db, lineClient, liffId = '', emailNotificat
         : 'ได้รับรายละเอียดโปรเจกต์แล้วครับ ทีม Donnar.Tech จะตรวจสอบข้อมูลและตอบกลับในแชตนี้ หากอยากคุยกับทีมโดยตรง พิมพ์ “คุยกับคน” ได้เลยครับ';
       const confirmation = buildIntakeReceivedCard(text);
       await client.query("INSERT INTO messages(conversation_id, direction, message_type, body, event_id, send_status, allow_human_mode) VALUES ($1, 'OUT', 'flex', $2, $3, 'PENDING', TRUE)", [conversation.id, JSON.stringify(confirmation), id]);
-      return true;
+      return Number(conversation.id);
     });
+    if (saved) notifyInboxUpdate(saved);
     try {
       await deliverPending(id, userId);
+      if (saved) notifyInboxUpdate(saved);
       const { rows } = await db.query("SELECT send_status FROM messages WHERE event_id = $1 AND direction = 'OUT'", [id]);
       return { duplicate: !saved, confirmationSent: rows[0]?.send_status === 'SENT' };
     } catch {
+      if (saved) notifyInboxUpdate(saved);
       return { duplicate: !saved, confirmationSent: false };
     }
   }

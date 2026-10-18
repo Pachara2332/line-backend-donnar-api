@@ -14,12 +14,40 @@ const { verifyIdToken, parseIntake, intakePage, channelIdFromLiffId } = require(
 const { escapeHtml } = require('./service/html');
 const { createQuotationService, parseQuotationForm, normalizeQuotation, bangkokToday, effectiveStatus, formatMoney, formatThaiDate, quotationLabel } = require('./service/quotations');
 const { renderQuotationPdf } = require('./service/quotationPdf');
-const { ADMIN_STYLE, quotationListPage, quotationEditorPage, quotationViewPage, conversationQuotationPanel, decisionPanel, publicQuotationPage, publicNotFoundPage, editorModel, formModel } = require('./service/quotationPages');
+const { ADMIN_STYLE, quotationListPage, quotationEditorPage, quotationViewPage, conversationQuotationPanel, publicQuotationPage, publicNotFoundPage, editorModel, formModel } = require('./service/quotationPages');
 const { buildQuotationCard } = require('./service/responseCards');
 
 function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
   const app = express();
-  const conversations = createConversationService({ db, lineClient, liffId: config.liffId, emailNotificationsEnabled: config.emailNotificationsEnabled, discordNotificationsEnabled: config.discordNotificationsEnabled });
+  const inboxStreams = new Set();
+  const inboxEventHistory = [];
+  let inboxEventSequence = 0;
+  function publishInboxUpdate(conversationId) {
+    const event = { id: ++inboxEventSequence, conversationId: Number(conversationId) };
+    inboxEventHistory.push(event);
+    if (inboxEventHistory.length > 500) inboxEventHistory.shift();
+    const payload = `id: ${event.id}\nevent: inbox-update\ndata: ${JSON.stringify({ conversationId: event.conversationId })}\n\n`;
+    for (const stream of inboxStreams) {
+      if (stream.writableEnded || stream.destroyed) {
+        inboxStreams.delete(stream);
+        continue;
+      }
+      try {
+        if (!stream.write(payload)) {
+          stream.end();
+          inboxStreams.delete(stream);
+        }
+      } catch {
+        stream.end();
+        inboxStreams.delete(stream);
+      }
+    }
+  }
+  app.locals.closeInboxStreams = () => {
+    for (const stream of inboxStreams) stream.end();
+    inboxStreams.clear();
+  };
+  const conversations = createConversationService({ db, lineClient, liffId: config.liffId, emailNotificationsEnabled: config.emailNotificationsEnabled, discordNotificationsEnabled: config.discordNotificationsEnabled, onInboxUpdate: publishInboxUpdate });
   const seller = config.seller || {};
   const quotations = createQuotationService({ db, seller });
   app.locals.lineClient = lineClient;
@@ -155,12 +183,86 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     await db.query('DELETE FROM staff_sessions WHERE expires_at < NOW()');
     await db.query("INSERT INTO staff_sessions(session_hash, username, csrf_token, expires_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP + INTERVAL '12 hours')", [hashToken(token), staff.username, csrf]);
     res.setHeader('Set-Cookie', sessionCookie(token, config.isProduction));
-    res.redirect(303, conversationId ? `/admin?conversation=${conversationId}#inbox` : '/admin');
+    res.redirect(303, conversationId ? `/admin/inbox?conversation=${conversationId}` : '/admin');
     } catch (error) { next(error); }
   });
 
   app.use('/admin/quotations', express.urlencoded({ extended: false, limit: '256kb', parameterLimit: 1000 }));
   app.use('/admin', express.urlencoded({ extended: false, limit: '20kb' }), requireStaff(db, config));
+  app.get('/admin/inbox/events', (req, res) => {
+    const rawCursor = req.get('last-event-id') || req.query.after || String(inboxEventSequence);
+    const cursor = /^\d+$/.test(String(rawCursor)) ? Number(rawCursor) : -1;
+    res.status(200).set({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders();
+    res.write('retry: 3000\n\n');
+    inboxStreams.add(res);
+    const cursorExpired = inboxEventHistory.length && cursor < inboxEventHistory[0].id - 1;
+    if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > inboxEventSequence || cursorExpired) {
+      res.write('event: inbox-reset\ndata: {}\n\n');
+    } else {
+      for (const event of inboxEventHistory) {
+        if (event.id > cursor) res.write(`id: ${event.id}\nevent: inbox-update\ndata: ${JSON.stringify({ conversationId: event.conversationId })}\n\n`);
+      }
+    }
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded || res.destroyed) {
+        clearInterval(heartbeat);
+        inboxStreams.delete(res);
+        return;
+      }
+      try { res.write(': keepalive\n\n'); } catch {
+        clearInterval(heartbeat);
+        inboxStreams.delete(res);
+        res.end();
+      }
+    }, 25000);
+    res.on('close', () => {
+      clearInterval(heartbeat);
+      inboxStreams.delete(res);
+    });
+  });
+  app.get('/admin/inbox/updates/:id', async (req, res, next) => {
+    const conversationId = positiveId(req.params.id);
+    if (!conversationId) return res.sendStatus(404);
+    try {
+      const { rows: conversations } = await db.query(`SELECT c.id, c.mode, c.current_step, c.line_user_id, l.status, l.requirements_json, u.display_name, u.picture_url
+        FROM conversations c JOIN leads l ON l.conversation_id = c.id JOIN line_users u ON u.line_user_id = c.line_user_id
+        WHERE c.id = $1`, [conversationId]);
+      const conversation = conversations[0];
+      if (!conversation) return res.sendStatus(404);
+      const messageLimit = req.query.messages === '1' ? 30 : 1;
+      const { rows: messages } = await db.query(`SELECT id, direction, body, created_at, send_status, last_error FROM (
+        SELECT id, direction, body, created_at, send_status, last_error FROM messages WHERE conversation_id = $1 ORDER BY id DESC LIMIT $2
+      ) recent ORDER BY id ASC`, [conversationId, messageLimit]);
+      const renderedMessages = messages.map((message) => ({
+        id: Number(message.id),
+        direction: message.direction,
+        text: readMessage(message.body),
+        createdAt: message.created_at,
+        sendStatus: message.send_status,
+        lastError: message.last_error,
+      }));
+      res.setHeader('Cache-Control', 'no-store');
+      return res.json({
+        conversation: {
+          id: Number(conversation.id),
+          displayName: conversation.display_name || conversation.line_user_id,
+          lineUserId: conversation.line_user_id,
+          pictureUrl: safeProfilePictureUrl(conversation.picture_url),
+          mode: conversation.mode,
+          currentStep: conversation.current_step,
+          status: conversation.status,
+          requirements: conversation.requirements_json || {},
+        },
+        messages: renderedMessages,
+      });
+    } catch (error) { return next(error); }
+  });
   const richMenuUploadLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
   app.post('/admin/rich-menu/draft', richMenuUploadLimit, parseRichMenuUpload, requireCsrf, async (req, res, next) => {
     try {
@@ -173,7 +275,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
         await client.query("DELETE FROM rich_menu_publications WHERE status = 'DRAFT'");
         await client.query("INSERT INTO rich_menu_publications(status, image_data, image_content_type) VALUES ('DRAFT', $1, $2)", [image, contentType]);
       });
-      return res.redirect(303, '/admin#rich-menu');
+      return res.redirect(303, '/admin/rich-menu');
     } catch (error) {
       if (error.code === '23505') return res.status(409).type('text').send('มี draft Rich Menu ถูกแก้ไขพร้อมกัน กรุณาลองอัปโหลดอีกครั้ง');
       return next(error);
@@ -191,17 +293,41 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
   app.post('/admin/rich-menu/draft/:id/cancel', requireCsrf, async (req, res, next) => {
     try {
       await db.query("DELETE FROM rich_menu_publications WHERE id = $1 AND status = 'DRAFT'", [Number(req.params.id)]);
-      return res.redirect(303, '/admin#rich-menu');
+      return res.redirect(303, '/admin/rich-menu');
     } catch (error) { return next(error); }
   });
   app.get('/admin', async (req, res, next) => {
     try {
+      const conversationId = positiveId(req.query.conversation);
+      if (conversationId) return res.redirect(303, `/admin/inbox?conversation=${conversationId}`);
+      return res.type('html').send(staffShell('ภาพรวม', 'overview', await overviewPage(db), req.staff, req.csrfToken));
+    } catch (error) { return next(error); }
+  });
+  app.get('/admin/inbox', async (req, res, next) => {
+    try {
       let profileRefreshResult = ['updated', 'unavailable', 'failed', 'cached'].includes(req.query.profile) ? req.query.profile : null;
-      const conversationId = Number(req.query.conversation);
-      if (!profileRefreshResult && Number.isSafeInteger(conversationId) && conversationId > 0) {
-        profileRefreshResult = await conversations.refreshProfileForConversation(conversationId);
-      }
-      return res.type('html').send(await adminPage(db, req.staff, req.csrfToken, req.query, { profileRefreshResult }));
+      const conversationId = positiveId(req.query.conversation);
+      if (!profileRefreshResult && conversationId) profileRefreshResult = await conversations.refreshProfileForConversation(conversationId);
+      const content = await inboxPage(db, req.csrfToken, req.query, { profileRefreshResult, inboxEventId: inboxEventSequence });
+      return res.type('html').send(staffShell('กล่องข้อความ', 'inbox', content, req.staff, req.csrfToken, ['/assets/admin-inbox.js?v=live-inbox-1']));
+    } catch (error) { return next(error); }
+  });
+  app.get('/admin/follow-ups', async (req, res, next) => {
+    try {
+      const content = await followUpsPage(db, req.csrfToken);
+      return res.type('html').send(staffShell('งานติดตาม', 'follow-ups', content, req.staff, req.csrfToken));
+    } catch (error) { return next(error); }
+  });
+  app.get('/admin/content', async (req, res, next) => {
+    try {
+      const content = await contentPage(db, req.csrfToken);
+      return res.type('html').send(staffShell('ข้อความบอต', 'content', content, req.staff, req.csrfToken));
+    } catch (error) { return next(error); }
+  });
+  app.get('/admin/rich-menu', async (req, res, next) => {
+    try {
+      const content = await richMenuPage(db, req.csrfToken);
+      return res.type('html').send(staffShell('Rich Menu', 'rich-menu', content, req.staff, req.csrfToken));
     } catch (error) { return next(error); }
   });
   app.post('/admin/notifications/:id/read', requireCsrf, async (req, res, next) => {
@@ -210,7 +336,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const { rows } = await db.query('UPDATE staff_notifications SET read_at = COALESCE(read_at, CURRENT_TIMESTAMP) WHERE id = $1 RETURNING conversation_id', [notificationId]);
       if (!rows[0]) return res.sendStatus(404);
-      return res.redirect(303, `/admin?conversation=${encodeURIComponent(rows[0].conversation_id)}#inbox`);
+      return res.redirect(303, `/admin/inbox?conversation=${encodeURIComponent(rows[0].conversation_id)}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/logout', requireCsrf, async (req, res, next) => {
@@ -223,7 +349,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const updated = await conversations.setMode(Number(req.params.id), req.body.mode, req.staff.username);
       if (!updated) return res.sendStatus(404);
-      return res.redirect(303, `/admin?conversation=${encodeURIComponent(req.params.id)}#inbox`);
+      return res.redirect(303, `/admin/inbox?conversation=${encodeURIComponent(req.params.id)}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/conversations/:id/reply', requireCsrf, async (req, res, next) => {
@@ -236,7 +362,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       if (conversation.mode !== 'HUMAN') return res.status(409).send('เปลี่ยนสถานะเป็น HUMAN ก่อนตอบแชต');
       const outgoingId = await deliverPush(conversation, { type: 'text', text });
       await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'conversation.staff_reply', 'message', String(outgoingId), JSON.stringify({ conversationId: conversation.id })]);
-      return res.redirect(303, `/admin?conversation=${encodeURIComponent(req.params.id)}#inbox`);
+      return res.redirect(303, `/admin/inbox?conversation=${encodeURIComponent(req.params.id)}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/conversations/:id/profile/refresh', requireCsrf, async (req, res, next) => {
@@ -245,7 +371,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const outcome = await conversations.refreshProfileForConversation(conversationId, { force: true });
       if (outcome === 'missing') return res.sendStatus(404);
-      return res.redirect(303, `/admin?conversation=${encodeURIComponent(conversationId)}&profile=${encodeURIComponent(outcome)}#inbox`);
+      return res.redirect(303, `/admin/inbox?conversation=${encodeURIComponent(conversationId)}&profile=${encodeURIComponent(outcome)}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/conversations/:id/quotations', requireCsrf, async (req, res, next) => {
@@ -261,10 +387,14 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const { rows } = await db.query('SELECT q.*, c.line_user_id, u.display_name FROM quotations q JOIN conversations c ON c.id = q.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id ORDER BY q.updated_at DESC, q.id DESC LIMIT 300');
       const statusFilter = ['DRAFT', 'SENT', 'ACCEPTED', 'REJECTED', 'EXPIRED', 'SUPERSEDED', 'CANCELLED'].includes(req.query.status) ? req.query.status : '';
-      return res.type('html').send(shell('ใบเสนอราคา', quotationListPage({ rows: rows.map(normalizeQuotation), staff: req.staff, csrfToken: req.csrfToken, seller, statusFilter, today: bangkokToday() })));
+      const content = quotationListPage({ rows: rows.map(normalizeQuotation), staff: req.staff, csrfToken: req.csrfToken, seller, statusFilter, today: bangkokToday() });
+      return res.type('html').send(staffShell('ใบเสนอราคา', 'quotations', content, req.staff, req.csrfToken));
     } catch (error) { return next(error); }
   });
-  const renderEditor = (res, req, loaded, { status = 200, model, errors = [], notice = '' } = {}) => res.status(status).type('html').send(shell(`แก้ไข ${quotationLabel(loaded.quotation)}`, quotationEditorPage({ quotation: loaded.quotation, model: model || editorModel(loaded.quotation, loaded.items), errors, staff: req.staff, csrfToken: req.csrfToken, seller, vatRateBp: quotations.vatRateBp(), notice }), ['/assets/quotation-editor.js']));
+  const renderEditor = (res, req, loaded, { status = 200, model, errors = [], notice = '' } = {}) => {
+    const content = quotationEditorPage({ quotation: loaded.quotation, model: model || editorModel(loaded.quotation, loaded.items), errors, staff: req.staff, csrfToken: req.csrfToken, seller, vatRateBp: quotations.vatRateBp(), notice });
+    return res.status(status).type('html').send(staffShell(`แก้ไข ${quotationLabel(loaded.quotation)}`, 'quotations', content, req.staff, req.csrfToken, ['/assets/quotation-editor.js']));
+  };
   const loadStaffQuotation = async (req, res, next) => {
     const quotationId = positiveId(req.params.id);
     if (!quotationId) return res.sendStatus(404);
@@ -280,7 +410,8 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       const { quotation, items } = req.quotation;
       if (quotation.status === 'DRAFT') return renderEditor(res, req, req.quotation, { notice: req.query.saved ? '<div class="q-alert ok">บันทึกฉบับร่างแล้ว</div>' : '' });
       const { rows: history } = await db.query('SELECT id, number, revision, status, valid_until, total_satang FROM quotations WHERE number = $1 ORDER BY revision', [quotation.number]);
-      return res.type('html').send(shell(quotationLabel(quotation), quotationViewPage({ quotation, items, history: history.map(normalizeQuotation), staff: req.staff, csrfToken: req.csrfToken, link: quotation.public_token ? quotationLink(quotation.public_token) : '', today: bangkokToday(), flash: req.query.flash }), ['/assets/quotation-editor.js']));
+      const content = quotationViewPage({ quotation, items, history: history.map(normalizeQuotation), staff: req.staff, csrfToken: req.csrfToken, link: quotation.public_token ? quotationLink(quotation.public_token) : '', today: bangkokToday(), flash: req.query.flash });
+      return res.type('html').send(staffShell(quotationLabel(quotation), 'quotations', content, req.staff, req.csrfToken, ['/assets/quotation-editor.js']));
     } catch (error) { return next(error); }
   });
   const saveDraftFromForm = async (req, res) => {
@@ -351,7 +482,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const conversationId = await quotations.deleteDraft(req.quotation.quotation.id, req.staff.username);
       if (!conversationId) return res.status(409).send('ลบได้เฉพาะฉบับร่าง');
-      return res.redirect(303, `/admin?conversation=${conversationId}#inbox`);
+      return res.redirect(303, `/admin/inbox?conversation=${conversationId}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/quotations/:id/decision/read', loadStaffQuotation, requireCsrf, async (req, res, next) => {
@@ -371,7 +502,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
         await client.query("INSERT INTO message_revisions(message_key, revision, body, status) VALUES ($1, $2, $3, 'DRAFT')", [key, Number(rows[0].next), body]);
         await client.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id) VALUES ($1, $2, $3, $4)', [req.staff.username, 'content.draft_created', 'message', key]);
       });
-      res.redirect(303, '/admin');
+      res.redirect(303, '/admin/content');
     } catch (error) { next(error); }
   });
   app.post('/admin/content/:id/publish', requireCsrf, async (req, res, next) => {
@@ -384,7 +515,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
         await client.query("UPDATE message_revisions SET status = 'PUBLISHED', published_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'DRAFT'", [revision.id]);
         await client.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id) VALUES ($1, $2, $3, $4)', [req.staff.username, 'content.published', 'message', revision.message_key]);
       });
-      res.redirect(303, '/admin');
+      res.redirect(303, '/admin/content');
     } catch (error) { next(error); }
   });
   app.post('/admin/rich-menu/preview', requireCsrf, (req, res) => res.type('html').send(menuPreview(config.publicBaseUrl, config.liffId)));
@@ -419,7 +550,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
         await client.query("UPDATE rich_menu_publications SET status = 'PUBLISHED', published_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'CREATING'", [publicationId]);
         await client.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id) VALUES ($1, $2, $3, $4)', [req.staff.username, 'rich_menu.published', 'rich_menu', richMenuId]);
       });
-      return res.redirect(303, '/admin');
+      return res.redirect(303, '/admin/rich-menu');
     } catch (error) {
       if (error.code === '23505') return res.status(409).send('มีการเผยแพร่ Rich Menu กำลังดำเนินการอยู่');
       if (publicationId) await db.query("UPDATE rich_menu_publications SET status = 'FAILED' WHERE id = $1 AND status = 'CREATING'", [publicationId]).catch(() => {});
@@ -529,14 +660,60 @@ function isValidWebhookEvent(event) {
 function shell(title, content, scripts = []) {
   return `<!doctype html><html lang="th"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Donnar.Tech</title><style>
   *{box-sizing:border-box} :root{color-scheme:light;--ink:#14233b;--muted:#718096;--line:#e3eaf2;--blue:#1769e8;--navy:#0d1b33;--surface:#fff;--wash:#f4f7fb;--green:#0e9f79}
-  body{margin:0;background:var(--wash);color:var(--ink);font:15px/1.55 Inter,"Noto Sans Thai",system-ui,-apple-system,sans-serif}header{background:var(--navy);color:white;padding:12px max(20px,calc((100vw - 1380px)/2));display:flex;align-items:center;gap:12px;min-height:68px;box-shadow:0 4px 18px #0d1b3318}header img{width:42px;height:42px;object-fit:contain;background:white;border-radius:12px;padding:3px}header strong{font-size:15px;letter-spacing:.01em}main{max-width:1380px;margin:28px auto;padding:0 24px}.card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:20px;margin:16px 0;box-shadow:0 8px 28px #14233b08}h1,h2,h3{line-height:1.25;letter-spacing:-.02em}h1{font-size:clamp(25px,3vw,34px);margin:0 0 6px}h2{font-size:19px;margin:0 0 14px}h3{font-size:16px}p{margin:.35em 0 1em}button,a.button{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:0;border-radius:10px;background:var(--blue);color:white;padding:10px 15px;text-decoration:none;font-family:inherit;font-size:14px;font-weight:600;line-height:1.2;cursor:pointer;transition:background .16s,transform .16s}button:hover,a.button:hover{background:#0d55c7;transform:translateY(-1px)}button.secondary{background:#eaf1fb;color:#21416e}button.secondary:hover{background:#dce8f8}button.danger{background:#e9f7f2;color:#087c61}input,textarea,select{font:inherit;width:100%;padding:10px 12px;border:1px solid #d4deea;border-radius:10px;margin:5px 0 10px;background:white;color:var(--ink)}input:focus,textarea:focus,select:focus{outline:3px solid #1769e822;border-color:#6b9ff0}textarea{min-height:92px;resize:vertical}label{display:block;font-size:13px;font-weight:600;color:#40516b}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid var(--line);vertical-align:top}.tag{display:inline-flex;align-items:center;font-size:12px;font-weight:700;padding:4px 9px;border-radius:999px;background:#e4f6ef;color:#087c61}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.chat{white-space:pre-wrap;max-width:620px}small,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.crm-top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:22px}.eyebrow{font-size:12px;font-weight:750;letter-spacing:.1em;text-transform:uppercase;color:var(--blue);margin-bottom:5px}.user-tools{display:flex;align-items:center;gap:12px}.user-tools form{margin:0}.user-tools button{padding:8px 12px}.crm-nav{display:flex;gap:8px;margin:0 0 18px}.crm-nav a{color:#56667d;text-decoration:none;padding:8px 12px;border-radius:9px;font-size:14px;font-weight:650}.crm-nav a.active,.crm-nav a:hover{background:#e9f1fd;color:var(--blue)}.metric-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0 0 18px}.metric{padding:15px 18px;background:white;border:1px solid var(--line);border-radius:14px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{font-size:25px;line-height:1.2}.metric.blue strong{color:var(--blue)}.metric.green strong{color:var(--green)}.metric.orange strong{color:#d77a12}.inbox{display:grid;grid-template-columns:minmax(280px,360px) minmax(0,1fr);min-height:620px;background:white;border:1px solid var(--line);border-radius:17px;overflow:hidden;box-shadow:0 10px 30px #14233b0a}.inbox-sidebar{border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0}.inbox-heading{padding:18px 18px 8px}.inbox-heading h2{margin:0}.filters{padding:0 16px 12px;border-bottom:1px solid var(--line)}.filters input,.filters select{margin:5px 0}.lead-list{overflow:auto;max-height:740px}.lead-link{display:block;padding:14px 17px;border-bottom:1px solid #edf1f6;color:inherit;text-decoration:none;transition:background .15s;border-left:3px solid transparent}.lead-link:hover{background:#f6f9fd}.lead-link.selected{background:#eef5ff;border-left-color:var(--blue)}.lead-link-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}.lead-link-top strong{font-size:14px}.lead-preview{color:#586981;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:5px}.lead-meta{font-size:11px;color:var(--muted);display:flex;gap:6px;align-items:center;flex-wrap:wrap}.mode-tag{font-size:10px;letter-spacing:.04em;padding:2px 7px;border-radius:99px;background:#e9eff8;color:#53647b;font-weight:750}.mode-tag.human{background:#fff1df;color:#a75a06}.mode-tag.bot{background:#e6f7f1;color:#078263}.inbox-detail{display:flex;flex-direction:column;min-width:0}.detail-head{padding:20px 22px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.detail-head h2{margin:0 0 4px}.detail-grid{display:grid;grid-template-columns:minmax(0,1fr) 230px;flex:1;min-height:0}.message-history{padding:18px 22px;overflow:auto;max-height:530px;background:linear-gradient(#fbfcfe,#f8fafd)}.message{max-width:min(78%,600px);padding:11px 13px;border-radius:14px;margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere;box-shadow:0 2px 8px #14233b08}.message.in{background:white;border:1px solid var(--line);border-top-left-radius:4px}.message.out{background:#e8f1ff;border:1px solid #d9e8ff;border-top-right-radius:4px;margin-left:auto}.message-meta{font-size:11px;color:var(--muted);margin-bottom:4px}.lead-details{padding:18px 15px;border-left:1px solid var(--line);background:#fff}.detail-label{font-size:11px;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.06em;margin:0 0 8px}.requirement{padding:8px 0;border-bottom:1px solid #edf1f6;font-size:13px}.requirement b{display:block;color:#50617a;font-size:11px;text-transform:capitalize}.composer{padding:16px 20px;border-top:1px solid var(--line);background:white}.composer form{display:flex;align-items:flex-end;gap:10px}.composer textarea{min-height:44px;max-height:130px;margin:0}.composer button{height:44px;white-space:nowrap}.composer-help{font-size:12px;color:var(--muted);margin:8px 0 0}.empty-state{padding:44px 24px;text-align:center;color:var(--muted)}.empty-icon{font-size:32px;margin-bottom:8px}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:30px 0 10px}.section-heading p{margin:0;color:var(--muted);font-size:13px}.revision-card{padding:16px;border:1px solid var(--line);border-radius:13px;background:white}.revision-card textarea{min-height:110px}.danger-note{padding:12px;border-radius:10px;background:#f2f6fb;color:#66758a;font-size:12px}
+  body{margin:0;background:var(--wash);color:var(--ink);font:15px/1.55 Inter,"Noto Sans Thai",system-ui,-apple-system,sans-serif}header{background:var(--navy);color:white;padding:12px max(20px,calc((100vw - 1380px)/2));display:flex;align-items:center;gap:12px;min-height:68px;box-shadow:0 4px 18px #0d1b3318}header img{width:42px;height:42px;object-fit:contain;background:white;border-radius:12px;padding:3px}header strong{font-size:15px;letter-spacing:.01em}main{max-width:1380px;margin:28px auto;padding:0 24px}.card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:20px;margin:16px 0;box-shadow:0 8px 28px #14233b08}h1,h2,h3{line-height:1.25;letter-spacing:-.02em}h1{font-size:clamp(25px,3vw,34px);margin:0 0 6px}h2{font-size:19px;margin:0 0 14px}h3{font-size:16px}p{margin:.35em 0 1em}button,a.button{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:0;border-radius:10px;background:var(--blue);color:white;padding:10px 15px;text-decoration:none;font-family:inherit;font-size:14px;font-weight:600;line-height:1.2;cursor:pointer;transition:background .16s,transform .16s}button:hover,a.button:hover{background:#0d55c7;transform:translateY(-1px)}button.secondary{background:#eaf1fb;color:#21416e}button.secondary:hover{background:#dce8f8}button.danger{background:#e9f7f2;color:#087c61}input,textarea,select{font:inherit;width:100%;padding:10px 12px;border:1px solid #d4deea;border-radius:10px;margin:5px 0 10px;background:white;color:var(--ink)}input:focus,textarea:focus,select:focus{outline:3px solid #1769e822;border-color:#6b9ff0}textarea{min-height:92px;resize:vertical}label{display:block;font-size:13px;font-weight:600;color:#40516b}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid var(--line);vertical-align:top}.tag{display:inline-flex;align-items:center;font-size:12px;font-weight:700;padding:4px 9px;border-radius:999px;background:#e4f6ef;color:#087c61}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.chat{white-space:pre-wrap;max-width:620px}small,.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}.crm-top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:22px}.eyebrow{font-size:12px;font-weight:750;letter-spacing:.1em;text-transform:uppercase;color:var(--blue);margin-bottom:5px}.user-tools{display:flex;align-items:center;gap:12px}.user-tools form{margin:0}.user-tools button{padding:8px 12px}.crm-nav{display:flex;gap:8px;margin:0 0 18px}.crm-nav a{color:#56667d;text-decoration:none;padding:8px 12px;border-radius:9px;font-size:14px;font-weight:650}.crm-nav a.active,.crm-nav a:hover{background:#e9f1fd;color:var(--blue)}.metric-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:0 0 18px}.metric{padding:15px 18px;background:white;border:1px solid var(--line);border-radius:14px}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{font-size:25px;line-height:1.2}.metric.blue strong{color:var(--blue)}.metric.green strong{color:var(--green)}.metric.orange strong{color:#d77a12}.inbox{display:grid;grid-template-columns:minmax(280px,360px) minmax(0,1fr);min-height:620px;background:white;border:1px solid var(--line);border-radius:17px;overflow:hidden;box-shadow:0 10px 30px #14233b0a}.inbox-sidebar{border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0}.inbox-heading{padding:18px 18px 8px}.inbox-heading h2{margin:0}.filters{padding:0 16px 12px;border-bottom:1px solid var(--line)}.filters input,.filters select{margin:5px 0}.lead-list{overflow:auto;max-height:740px}.lead-link{display:block;padding:14px 17px;border-bottom:1px solid #edf1f6;color:inherit;text-decoration:none;transition:background .15s;border-left:3px solid transparent}.lead-link:hover{background:#f6f9fd}.lead-link.selected{background:#eef5ff;border-left-color:var(--blue)}.lead-link-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}.lead-link-top strong{font-size:14px}.lead-preview{color:#586981;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:5px}.lead-meta{font-size:11px;color:var(--muted);display:flex;gap:6px;align-items:center;flex-wrap:wrap}.mode-tag{font-size:10px;letter-spacing:.04em;padding:2px 7px;border-radius:99px;background:#e9eff8;color:#53647b;font-weight:750}.mode-tag.human{background:#fff1df;color:#a75a06}.mode-tag.bot{background:#e6f7f1;color:#078263}.inbox-detail{display:flex;flex-direction:column;min-width:0}.inbox-back{display:none}.detail-head{padding:20px 22px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.detail-head h2{margin:0 0 4px}.detail-grid{display:grid;grid-template-columns:minmax(0,1fr) 230px;flex:1;min-height:0}.message-history{padding:18px 22px;overflow:auto;max-height:530px;background:linear-gradient(#fbfcfe,#f8fafd)}.message{max-width:min(78%,600px);padding:11px 13px;border-radius:14px;margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere;box-shadow:0 2px 8px #14233b08}.message.in{background:white;border:1px solid var(--line);border-top-left-radius:4px}.message.out{background:#e8f1ff;border:1px solid #d9e8ff;border-top-right-radius:4px;margin-left:auto}.message-meta{font-size:11px;color:var(--muted);margin-bottom:4px}.lead-details{padding:18px 15px;border-left:1px solid var(--line);background:#fff}.detail-label{font-size:11px;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.06em;margin:0 0 8px}.requirement{padding:8px 0;border-bottom:1px solid #edf1f6;font-size:13px}.requirement b{display:block;color:#50617a;font-size:11px;text-transform:capitalize}.composer{padding:16px 20px;border-top:1px solid var(--line);background:white}.composer form{display:flex;align-items:flex-end;gap:10px}.composer textarea{min-height:44px;max-height:130px;margin:0}.composer button{height:44px;white-space:nowrap}.composer-help{font-size:12px;color:var(--muted);margin:8px 0 0}.empty-state{padding:44px 24px;text-align:center;color:var(--muted)}.empty-icon{font-size:32px;margin-bottom:8px}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:30px 0 10px}.section-heading p{margin:0;color:var(--muted);font-size:13px}.revision-card{padding:16px;border:1px solid var(--line);border-radius:13px;background:white}.revision-card textarea{min-height:110px}.danger-note{padding:12px;border-radius:10px;background:#f2f6fb;color:#66758a;font-size:12px}
   @media(max-width:850px){main{padding:0 15px;margin:20px auto}.inbox{grid-template-columns:300px minmax(0,1fr)}.detail-grid{grid-template-columns:1fr}.lead-details{border-left:0;border-top:1px solid var(--line)}.message-history{max-height:460px}}
-  @media(max-width:620px){header{padding:10px 15px;min-height:58px}header img{width:38px;height:38px}main{padding:0 10px;margin:16px auto}.crm-top{align-items:flex-start;flex-direction:column}.user-tools{width:100%;justify-content:space-between}.metric-grid{gap:7px}.metric{padding:11px 10px}.metric span{font-size:11px}.metric strong{font-size:21px}.crm-nav{overflow:auto}.inbox{display:flex;flex-direction:column;min-height:0}.inbox-sidebar{border-right:0}.lead-list{max-height:310px}.inbox-detail{border-top:4px solid #f0f4f9}.detail-head{padding:15px;flex-direction:column}.message-history{max-height:390px;padding:14px}.message{max-width:90%}.composer{padding:12px}.composer form{align-items:stretch;flex-direction:column}.composer textarea{min-height:70px}.composer button{width:100%}.card{padding:15px}}
+  @media(max-width:620px){header{padding:10px 15px;min-height:58px}header img{width:38px;height:38px}main{padding:0 10px;margin:16px auto}.crm-top{align-items:flex-start;flex-direction:column}.user-tools{width:100%;justify-content:space-between}.metric-grid{gap:7px}.metric{padding:11px 10px}.metric span{font-size:11px}.metric strong{font-size:21px}.crm-nav{overflow:auto}.inbox{display:flex;flex-direction:column;min-height:0}.inbox-sidebar{border-right:0}.lead-list{max-height:310px}.inbox.has-selection .inbox-sidebar{display:none}.inbox:not(.has-selection) .inbox-detail{display:none}.inbox-back{display:inline-flex;margin:0 0 12px;font-size:13px}.inbox-detail{border-top:4px solid #f0f4f9}.detail-head{padding:15px;flex-direction:column}.message-history{max-height:390px;padding:14px}.message{max-width:90%}.composer{padding:12px}.composer form{align-items:stretch;flex-direction:column}.composer textarea{min-height:70px}.composer button{width:100%}.card{padding:15px}}
   @media(max-width:620px){.triage-grid{grid-template-columns:1fr}}
   .profile-identity{display:flex;align-items:center;gap:10px;min-width:0}.profile-identity>span{min-width:0}.profile-identity strong,.profile-identity small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.profile-avatar,.profile-avatar-fallback{width:34px;height:34px;flex:0 0 auto;border-radius:50%;object-fit:cover;background:#e8eef6}.profile-avatar-fallback{display:inline-flex;align-items:center;justify-content:center;color:#62748b;font-size:11px;font-weight:800}.profile-header .profile-avatar,.profile-header .profile-avatar-fallback{width:48px;height:48px}.profile-header h2{margin:0 0 3px}.profile-status{display:flex;align-items:center;gap:8px;margin-top:8px;color:var(--muted);font-size:12px}.profile-status form{margin:0}.profile-status button{padding:6px 9px;font-size:12px}
   .triage-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:0 0 18px}.triage-panel{margin:0;padding:16px;min-width:0}.triage-panel .section-heading{margin:0 0 12px}.triage-panel .section-heading h2{margin:0 0 4px}.triage-panel .section-heading p{font-size:12px}.triage-list{display:grid;gap:8px;max-height:310px;overflow:auto}.triage-item{display:block;padding:12px;border:1px solid var(--line);border-radius:12px;background:#fbfcfe;color:inherit;text-decoration:none;min-width:0}.triage-item-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.triage-item-top strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.triage-item time,.wait-time{font-size:11px;color:var(--muted);white-space:nowrap}.count-pill{display:inline-flex;min-width:24px;height:24px;align-items:center;justify-content:center;border-radius:999px;padding:0 7px;background:#e8f1ff;color:var(--blue);font-size:12px;vertical-align:middle}.triage-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}.triage-actions form{margin:0}.triage-actions button,.triage-actions .button{padding:7px 10px;font-size:12px}.triage-empty{padding:24px 12px;border:1px dashed var(--line);border-radius:12px}.waiting-item:hover{background:#f3f7ff;border-color:#cbdcf8}.wait-time{color:#b76508;font-weight:700}
   .menu-upload{max-width:620px;padding:16px;border:1px solid var(--line);border-radius:13px;background:#fbfcfe}.menu-upload input[type=file]{background:white}.menu-upload small{display:block;margin:-3px 0 12px}.rich-menu-preview{display:block;width:min(100%,720px);height:auto;margin:12px 0;border:1px solid var(--line);border-radius:12px;background:#f4f7fb}.menu-draft{margin-top:14px}
-  </style><header><img src="/assets/donnar-tech-logo.png" alt="Donnar.Tech"><strong>Donnar.Tech <span style="opacity:.65;font-weight:450">· LINE Back Office</span></strong></header><main>${content}</main>${title === 'CRM Inbox' ? '<script src="/assets/admin-inbox.js" defer></script>' : ''}${scripts.map((src) => `<script src="${escapeHtml(src)}" defer></script>`).join('')}</html>`;
+  .staff-layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:20px;align-items:start}.staff-nav{position:sticky;top:18px;background:white;border:1px solid var(--line);border-radius:16px;padding:12px;box-shadow:0 8px 28px #14233b08}.staff-nav a{display:flex;align-items:center;min-height:42px;padding:9px 12px;border-radius:10px;color:#53647b;text-decoration:none;font-weight:650}.staff-nav a:hover{background:#f4f7fb;color:var(--ink)}.staff-nav a.active{background:#e9f1fd;color:var(--blue)}.staff-content{min-width:0}.staff-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin:0 0 18px}.staff-toolbar form{margin:0}.staff-toolbar button{padding:8px 12px}.staff-user{color:var(--muted);font-size:13px}.overview-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:0 0 20px}.overview-card{display:flex;flex-direction:column;gap:4px;padding:17px;background:white;border:1px solid var(--line);border-radius:14px;color:inherit;text-decoration:none;box-shadow:0 8px 28px #14233b08}.overview-card:hover{border-color:#b8d0f6;transform:translateY(-1px)}.overview-card span{color:var(--muted);font-size:13px}.overview-card strong{font-size:26px;line-height:1.2}.overview-card small{font-size:12px}.overview-card.blue strong{color:var(--blue)}.overview-card.orange strong{color:#d77a12}.overview-card.green strong{color:var(--green)}.overview-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.overview-action{display:block;padding:17px;background:white;border:1px solid var(--line);border-radius:14px;color:inherit;text-decoration:none}.overview-action:hover{border-color:#b8d0f6;background:#fbfcfe}.overview-action h2{margin:0 0 5px}.overview-action p{margin:0;color:var(--muted);font-size:13px}
+  @media(max-width:850px){.staff-layout{grid-template-columns:1fr}.staff-nav{position:static;display:flex;gap:4px;overflow-x:auto;white-space:nowrap}.staff-nav a{flex:0 0 auto}}
+  @media(max-width:620px){.staff-nav{padding:7px}.staff-nav a{min-height:38px;padding:8px 10px;font-size:13px}.staff-toolbar{justify-content:space-between}.overview-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.overview-card{padding:13px}.overview-card strong{font-size:22px}.overview-actions{grid-template-columns:1fr}}
+  </style><header><img src="/assets/donnar-tech-logo.png" alt="Donnar.Tech"><strong>Donnar.Tech <span style="opacity:.65;font-weight:450">· LINE Back Office</span></strong></header><main>${content}</main>${scripts.map((src) => `<script src="${escapeHtml(src)}" defer></script>`).join('')}</html>`;
+}
+
+function staffShell(title, activePage, content, staff, csrfToken, scripts = []) {
+  const items = [
+    { key: 'overview', href: '/admin', label: 'ภาพรวม' },
+    { key: 'inbox', href: '/admin/inbox', label: 'กล่องข้อความ' },
+    { key: 'follow-ups', href: '/admin/follow-ups', label: 'งานติดตาม' },
+    { key: 'quotations', href: '/admin/quotations', label: 'ใบเสนอราคา' },
+    { key: 'content', href: '/admin/content', label: 'ข้อความบอต' },
+    { key: 'rich-menu', href: '/admin/rich-menu', label: 'Rich Menu' },
+  ];
+  const navigation = items.map((item) => `<a href="${item.href}" class="${item.key === activePage ? 'active' : ''}"${item.key === activePage ? ' aria-current="page"' : ''}>${item.label}</a>`).join('');
+  const toolbar = `<div class="staff-toolbar"><span class="staff-user">เข้าสู่ระบบเป็น <b>${escapeHtml(staff.username)}</b></span><form method="post" action="/admin/logout"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ออกจากระบบ</button></form></div>`;
+  return shell(title, `<div class="staff-layout"><nav class="staff-nav" aria-label="เมนูหลังบ้าน">${navigation}</nav><div class="staff-content">${toolbar}${content}</div></div>`, scripts);
+}
+
+async function overviewPage(db) {
+  const { rows } = await db.query(`SELECT
+    (SELECT COUNT(*)::integer FROM leads) AS lead_count,
+    (SELECT COUNT(*)::integer FROM staff_notifications WHERE type = 'new_lead' AND read_at IS NULL) AS new_lead_count,
+    (SELECT COUNT(*)::integer
+      FROM leads l JOIN conversations c ON c.id = l.conversation_id
+      JOIN LATERAL (
+        SELECT m.id, m.created_at FROM messages m
+        WHERE m.conversation_id = c.id AND m.direction = 'IN'
+        ORDER BY m.created_at DESC, m.id DESC LIMIT 1
+      ) inbound ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT m.id, m.created_at FROM messages m
+        WHERE m.conversation_id = c.id AND m.direction = 'OUT' AND m.send_status = 'SENT'
+        ORDER BY m.created_at DESC, m.id DESC LIMIT 1
+      ) sent ON TRUE
+      WHERE sent.id IS NULL OR (sent.created_at, sent.id) < (inbound.created_at, inbound.id)
+    ) AS waiting_count,
+    (SELECT COUNT(*)::integer FROM quotations WHERE decided_at IS NOT NULL AND decision_read_at IS NULL) AS quotation_decision_count`);
+  const stats = rows[0] || {};
+  const cards = [
+    { href: '/admin/inbox', label: 'Lead ทั้งหมด', value: stats.lead_count, hint: 'เปิดกล่องข้อความ', tone: 'blue' },
+    { href: '/admin/follow-ups', label: 'Lead ใหม่', value: stats.new_lead_count, hint: 'ยังไม่ได้อ่าน', tone: 'orange' },
+    { href: '/admin/follow-ups', label: 'รอทีมตอบ', value: stats.waiting_count, hint: 'มีข้อความรอติดตาม', tone: 'orange' },
+    { href: '/admin/quotations', label: 'ใบเสนอราคาที่มีคำตอบใหม่', value: stats.quotation_decision_count, hint: 'เปิดใบเสนอราคา', tone: 'green' },
+  ].map((item) => `<a class="overview-card ${item.tone}" href="${item.href}"><span>${item.label}</span><strong>${Number(item.value || 0)}</strong><small>${item.hint}</small></a>`).join('');
+  return `<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>ภาพรวม</h1><p class="muted">สรุปงานและทางลัดไปยังส่วนที่ต้องจัดการ</p></div></div><section class="overview-metrics" aria-label="สรุปงาน">${cards}</section><section class="overview-actions" aria-label="ทางลัด"><a class="overview-action" href="/admin/inbox"><h2>กล่องข้อความ</h2><p>ค้นหาและตอบลูกค้าจาก LINE</p></a><a class="overview-action" href="/admin/follow-ups"><h2>งานติดตาม</h2><p>ตรวจ Lead ใหม่และบทสนทนาที่รอทีมตอบ</p></a></section>`;
 }
 
 function loginPage(error = '', requestedConversation) {
@@ -544,17 +721,83 @@ function loginPage(error = '', requestedConversation) {
   return shell('Staff login', `<section class="card" style="max-width:420px;margin:10vh auto"><h1>เข้าสู่ระบบทีม</h1>${error ? `<p role="alert">${escapeHtml(error)}</p>` : ''}<form method="post" action="/admin/login">${conversationId ? `<input type="hidden" name="conversation" value="${conversationId}">` : ''}<label>ชื่อผู้ใช้<input name="username" autocomplete="username" required></label><label>รหัสผ่าน<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">เข้าสู่ระบบ</button></form></section>`);
 }
 
-async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResult = null } = {}) {
-  const [{ rows: leads }, { rows: revisions }, { rows: menus }, { rows: notifications }, { rows: unreadCountRows }, { rows: waitingLeads }, { rows: quotationDecisions }] = await Promise.all([
-    db.query(`SELECT l.*, c.id AS conversation_id, c.mode, c.current_step, c.line_user_id, u.display_name, u.picture_url, u.profile_synced_at FROM leads l JOIN conversations c ON c.id = l.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id ORDER BY l.updated_at DESC`),
-    db.query('SELECT * FROM message_revisions ORDER BY message_key, revision DESC'),
-    db.query('SELECT id, line_menu_id, image_uploaded, image_content_type, status, created_at, published_at FROM rich_menu_publications ORDER BY id DESC LIMIT 10'),
-    db.query(`SELECT n.id, n.created_at, l.id AS lead_id, l.status, l.requirements_json, c.id AS conversation_id, c.mode, c.current_step, c.line_user_id, u.display_name, u.picture_url, u.profile_synced_at
-      FROM staff_notifications n JOIN leads l ON l.conversation_id = n.conversation_id JOIN conversations c ON c.id = n.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id
+async function inboxPage(db, csrfToken, query = {}, { profileRefreshResult = null, inboxEventId = 0 } = {}) {
+  const rawSearch = typeof query.q === 'string' ? query.q : '';
+  const search = rawSearch.trim();
+  const modeFilter = ['BOT', 'HUMAN'].includes(query.mode) ? query.mode : '';
+  const statusFilter = ['NEW', 'QUALIFYING', 'QUALIFIED', 'HUMAN_REQUIRED'].includes(query.status) ? query.status : '';
+  const leadSelect = `SELECT l.*, c.id AS conversation_id, c.mode, c.current_step, c.line_user_id, u.display_name, u.picture_url, u.profile_synced_at, preview.body AS preview_body
+    FROM leads l
+    JOIN conversations c ON c.id = l.conversation_id
+    JOIN line_users u ON u.line_user_id = c.line_user_id
+    LEFT JOIN LATERAL (
+      SELECT m.body FROM messages m
+      WHERE m.conversation_id = c.id
+      ORDER BY m.id DESC LIMIT 1
+    ) preview ON TRUE`;
+  const { rows: visibleLeads } = await db.query(`${leadSelect}
+    WHERE ($1 = '' OR
+      POSITION(LOWER($1) IN LOWER(COALESCE(u.display_name, ''))) > 0 OR
+      POSITION(LOWER($1) IN LOWER(COALESCE(c.line_user_id, ''))) > 0 OR
+      POSITION(LOWER($1) IN LOWER(COALESCE(l.status, ''))) > 0 OR
+      POSITION(LOWER($1) IN LOWER(COALESCE(c.current_step, ''))) > 0 OR
+      POSITION(LOWER($1) IN LOWER(COALESCE(l.requirements_json::text, ''))) > 0 OR
+      EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id AND POSITION(LOWER($1) IN LOWER(COALESCE(m.body, ''))) > 0)
+    ) AND ($2 = '' OR c.mode = $2) AND ($3 = '' OR l.status = $3)
+    ORDER BY l.updated_at DESC, l.id DESC LIMIT 100`, [search, modeFilter, statusFilter]);
+  const requestedId = typeof query.conversation === 'string' ? positiveId(query.conversation) : null;
+  let selected = requestedId ? visibleLeads.find((lead) => Number(lead.conversation_id) === requestedId) : null;
+  if (requestedId && !selected) {
+    const { rows } = await db.query(`${leadSelect} WHERE c.id = $1`, [requestedId]);
+    selected = rows[0] || null;
+  }
+  selected = selected || visibleLeads[0] || null;
+  const selectedMessages = selected
+    ? (await db.query('SELECT id, direction, body, created_at, send_status, last_error FROM messages WHERE conversation_id = $1 ORDER BY id DESC LIMIT 30', [selected.conversation_id])).rows.reverse()
+    : [];
+  const selectedQuotations = selected
+    ? (await db.query('SELECT id, number, revision, status, valid_until, total_satang FROM quotations WHERE conversation_id = $1 ORDER BY created_at DESC, id DESC LIMIT 10', [selected.conversation_id])).rows.map(normalizeQuotation)
+    : [];
+  const selectedRequirements = selected?.requirements_json || {};
+  const today = bangkokToday();
+  const statusLabels = { NEW: 'ลูกค้าใหม่', QUALIFYING: 'กำลังเก็บข้อมูล', QUALIFIED: 'คัดกรองแล้ว', HUMAN_REQUIRED: 'รอพนักงาน' };
+  const stepLabels = { serviceType: 'ประเภทงาน', projectSummary: 'รายละเอียดโปรเจกต์', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ', complete: 'เก็บข้อมูลครบแล้ว' };
+  const requirementLabels = { serviceType: 'ประเภทงาน', projectSummary: 'รายละเอียดโปรเจกต์', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ' };
+  const listParams = new URLSearchParams({ ...(search ? { q: search } : {}), ...(modeFilter ? { mode: modeFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}) });
+  const listHref = `/admin/inbox${listParams.size ? `?${listParams.toString()}` : ''}`;
+  const selectedHref = (lead) => `/admin/inbox?${new URLSearchParams({ ...(search ? { q: search } : {}), ...(modeFilter ? { mode: modeFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), conversation: String(lead.conversation_id) }).toString()}`;
+  const leadRows = visibleLeads.map((lead) => {
+    const requirements = lead.requirements_json || {};
+    const summary = lead.preview_body ? readMessage(lead.preview_body) : Object.values(requirements)[0] || 'เริ่มต้นบทสนทนา';
+    const modeLabel = lead.mode === 'HUMAN' ? 'รอทีมตอบ' : 'บอตดูแล';
+    return `<a class="lead-link${selected && String(selected.conversation_id) === String(lead.conversation_id) ? ' selected' : ''}" data-conversation-id="${lead.conversation_id}" href="${selectedHref(lead)}"><div class="lead-link-top"><div class="profile-identity">${profileAvatar(lead, 34)}<span><strong>${escapeHtml(lead.display_name || lead.line_user_id)}</strong><small>${escapeHtml(lead.line_user_id)}</small></span></div><span class="mode-tag ${lead.mode === 'HUMAN' ? 'human' : 'bot'}">${modeLabel}</span></div><div class="lead-meta"><span>${escapeHtml(statusLabels[lead.status] || lead.status)}</span><span>·</span><span>${escapeHtml(stepLabels[lead.current_step] || lead.current_step)}</span></div><div class="lead-preview">${escapeHtml(summary)}</div></a>`;
+  }).join('');
+  const hasFilters = Boolean(search || modeFilter || statusFilter);
+  const emptyLeads = hasFilters
+    ? `<div class="empty-state"><div class="empty-icon">🔎</div>ไม่พบรายการที่ตรงกับตัวกรอง<br><a href="/admin/inbox">ล้างตัวกรอง</a></div>`
+    : '<div class="empty-state"><div class="empty-icon">📭</div>ยังไม่มีบทสนทนา</div>';
+  const requirementRows = Object.entries(selectedRequirements).map(([key, value]) => `<div class="requirement"><b>${escapeHtml(requirementLabels[key] || key)}</b>${escapeHtml(value)}</div>`).join('') || '<p class="muted" style="font-size:13px">ยังไม่มีข้อมูลจากแบบสอบถาม</p>';
+  const messageBubbles = selectedMessages.map((message) => {
+    const pending = message.direction === 'OUT' && !['SENT', 'CANCELLED'].includes(message.send_status);
+    const delivery = pending ? ` · ${escapeHtml(message.send_status)}${message.last_error ? ` (${escapeHtml(message.last_error)})` : ''}` : '';
+    return `<div class="message ${message.direction === 'IN' ? 'in' : 'out'}" data-message-id="${message.id}"><div class="message-meta">${message.direction === 'IN' ? 'ลูกค้า' : 'Donnar.Tech'} · ${escapeHtml(formatAdminDateTime(message.created_at))}${delivery}</div>${escapeHtml(readMessage(message.body))}</div>`;
+  }).join('');
+  const profileStatusText = { updated: 'อัปเดตรูปจาก LINE แล้ว', unavailable: 'LINE ยังไม่มีรูปโปรไฟล์ให้แสดง', failed: 'โหลดโปรไฟล์ไม่สำเร็จ ลองใหม่ได้', cached: 'ใช้ข้อมูลโปรไฟล์ที่บันทึกไว้' }[profileRefreshResult];
+  const profileStatus = selected && !safeProfilePictureUrl(selected.picture_url)
+    ? `<div class="profile-status"><span>${escapeHtml(profileStatusText || (selected.profile_synced_at ? 'LINE ยังไม่มีรูปโปรไฟล์ให้แสดง' : 'ยังไม่พบรูปโปรไฟล์ LINE'))}</span><form method="post" action="/admin/conversations/${selected.conversation_id}/profile/refresh"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ลองโหลดรูปใหม่</button></form></div>`
+    : '';
+  const detail = selected ? `<section class="inbox-detail"><div class="detail-head"><div><a class="inbox-back" href="${escapeHtml(listHref)}">← กลับรายการ</a><div class="profile-identity profile-header">${profileAvatar(selected, 48)}<span><h2>${escapeHtml(selected.display_name || selected.line_user_id)}</h2><div class="muted" style="font-size:13px">LINE UID: ${escapeHtml(selected.line_user_id)}</div><div style="margin-top:9px"><span class="tag">${escapeHtml(statusLabels[selected.status] || selected.status)}</span> <span class="mode-tag ${selected.mode === 'HUMAN' ? 'human' : 'bot'}">${selected.mode === 'HUMAN' ? 'พนักงานดูแล' : 'บอตดูแล'}</span></div>${profileStatus}</span></div></div><form method="post" action="/admin/conversations/${selected.conversation_id}/mode"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="mode" value="${selected.mode === 'BOT' ? 'HUMAN' : 'BOT'}"><button class="${selected.mode === 'BOT' ? '' : 'secondary'}" type="submit">${selected.mode === 'BOT' ? 'รับช่วงตอบลูกค้า' : 'ส่งคืนให้บอต'}</button></form></div><div class="detail-grid"><div class="message-history" id="message-history">${messageBubbles || '<div class="empty-state"><div class="empty-icon">💬</div>ยังไม่มีข้อความในบทสนทนา</div>'}</div><aside class="lead-details"><div class="detail-label">รายละเอียดโปรเจกต์</div><div id="conversation-requirements">${requirementRows}</div><div class="requirement" id="conversation-current-step"><b>ขั้นตอนปัจจุบัน</b>${escapeHtml(stepLabels[selected.current_step] || selected.current_step)}</div><div class="requirement" id="conversation-lead-status"><b>สถานะ Lead</b>${escapeHtml(statusLabels[selected.status] || selected.status)}</div>${conversationQuotationPanel({ quotations: selectedQuotations, conversationId: selected.conversation_id, csrfToken, today })}</aside></div><div class="composer">${selected.mode === 'HUMAN' ? `<form method="post" action="/admin/conversations/${selected.conversation_id}/reply"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><textarea name="text" maxlength="2000" placeholder="พิมพ์ข้อความตอบลูกค้า…" aria-label="ข้อความตอบลูกค้า" required></textarea><button type="submit">ส่งข้อความ <span aria-hidden="true">➤</span></button></form><p class="composer-help">กด “ส่งคืนให้บอต” เมื่อพร้อมให้บอตดูแลบทสนทนาต่อ</p>` : '<div class="danger-note">บอตกำลังดูแลบทสนทนานี้ หากต้องการตอบลูกค้า ให้กด “รับช่วงตอบลูกค้า” ก่อน</div>'}</div></section>` : '<section class="inbox-detail empty-state"><div class="empty-icon">🔎</div><h2>ยังไม่มีบทสนทนาที่ตรงกับตัวกรอง</h2><p>ลองเปลี่ยนคำค้นหาหรือล้างตัวกรอง</p></section>';
+  const title = `<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>กล่องข้อความ</h1><p class="muted">ค้นหาและจัดการบทสนทนาจาก LINE · แสดง 100 รายการล่าสุด</p></div></div>`;
+  return `${ADMIN_STYLE}${title}<section class="inbox${selected ? ' has-selection' : ''}" id="inbox" data-selected-conversation="${selected ? selected.conversation_id : ''}" data-inbox-event-id="${inboxEventId}"><aside class="inbox-sidebar"><div class="inbox-heading"><h2>บทสนทนา <span class="muted" style="font-size:13px;font-weight:500" id="lead-count">(${visibleLeads.length})</span></h2></div><form method="get" action="/admin/inbox" class="filters"><input name="q" type="search" value="${escapeHtml(rawSearch)}" placeholder="ค้นหา UID, ข้อความ หรือรายละเอียด" aria-label="ค้นหา lead"><label for="mode-filter">สถานะการดูแล</label><select id="mode-filter" name="mode"><option value="">ทุกสถานะ</option><option value="BOT"${modeFilter === 'BOT' ? ' selected' : ''}>บอตดูแล</option><option value="HUMAN"${modeFilter === 'HUMAN' ? ' selected' : ''}>รอทีมตอบ</option></select><label for="lead-status-filter">สถานะ lead</label><select id="lead-status-filter" name="status"><option value="">ทั้งหมด</option><option value="NEW"${statusFilter === 'NEW' ? ' selected' : ''}>ใหม่</option><option value="QUALIFYING"${statusFilter === 'QUALIFYING' ? ' selected' : ''}>กำลังเก็บข้อมูล</option><option value="QUALIFIED"${statusFilter === 'QUALIFIED' ? ' selected' : ''}>คัดกรองแล้ว</option><option value="HUMAN_REQUIRED"${statusFilter === 'HUMAN_REQUIRED' ? ' selected' : ''}>ต้องการทีมดูแล</option></select><button type="submit" class="secondary" style="width:100%">ค้นหา / กรอง</button></form><div class="lead-list">${leadRows || emptyLeads}</div></aside>${detail}</section>`;
+}
+async function followUpsPage(db, csrfToken) {
+  const [{ rows: notifications }, { rows: unreadCountRows }, { rows: waitingLeads }] = await Promise.all([
+    db.query(`SELECT n.id, n.created_at, c.id AS conversation_id, c.line_user_id, u.display_name
+      FROM staff_notifications n JOIN conversations c ON c.id = n.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id
       WHERE n.type = 'new_lead' AND n.read_at IS NULL ORDER BY n.created_at DESC, n.id DESC LIMIT 10`),
     db.query("SELECT COUNT(*)::integer AS count FROM staff_notifications WHERE type = 'new_lead' AND read_at IS NULL"),
-    db.query(`SELECT l.*, c.id AS conversation_id, c.mode, c.current_step, c.line_user_id, u.display_name, u.picture_url, u.profile_synced_at,
-        inbound.id AS waiting_message_id, inbound.body AS waiting_body, inbound.created_at AS waiting_since
+    db.query(`SELECT c.id AS conversation_id, c.line_user_id, u.display_name,
+        inbound.body AS waiting_body, inbound.created_at AS waiting_since
       FROM leads l JOIN conversations c ON c.id = l.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id
       JOIN LATERAL (
         SELECT m.id, m.body, m.created_at FROM messages m
@@ -568,81 +811,29 @@ async function adminPage(db, staff, csrfToken, query = {}, { profileRefreshResul
       ) sent ON TRUE
       WHERE sent.id IS NULL OR (sent.created_at, sent.id) < (inbound.created_at, inbound.id)
       ORDER BY inbound.created_at ASC, inbound.id ASC`),
-    db.query('SELECT id, number, revision, status, valid_until, buyer_json, total_satang, decided_at FROM quotations WHERE decided_at IS NOT NULL AND decision_read_at IS NULL ORDER BY decided_at DESC LIMIT 10'),
   ]);
+  const unreadCount = Number(unreadCountRows[0]?.count || 0);
+  const notificationRows = notifications.map((notification) => `<article class="triage-item"><div class="triage-item-top"><strong>${escapeHtml(notification.display_name || notification.line_user_id)}</strong><time>${escapeHtml(formatAdminDateTime(notification.created_at))}</time></div><div class="lead-meta">มี lead ใหม่จาก LINE</div><div class="triage-actions"><a class="button secondary" href="/admin/inbox?conversation=${encodeURIComponent(notification.conversation_id)}">เปิดบทสนทนา</a><form method="post" action="/admin/notifications/${encodeURIComponent(notification.id)}/read"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ทำเครื่องหมายว่าอ่านแล้ว</button></form></div></article>`).join('') || '<div class="empty-state triage-empty">ยังไม่มี Lead ใหม่ที่ยังไม่ได้อ่าน</div>';
+  const waitingRows = waitingLeads.map((lead) => `<a class="triage-item waiting-item" href="/admin/inbox?conversation=${encodeURIComponent(lead.conversation_id)}"><div class="triage-item-top"><strong>${escapeHtml(lead.display_name || lead.line_user_id)}</strong><span class="wait-time">รอ ${escapeHtml(formatElapsed(lead.waiting_since))}</span></div><div class="lead-meta">ข้อความล่าสุดจากลูกค้า · ${escapeHtml(formatAdminDateTime(lead.waiting_since))}</div><div class="lead-preview">${escapeHtml(readMessage(lead.waiting_body))}</div></a>`).join('') || '<div class="empty-state triage-empty">ไม่มีบทสนทนาที่รอคำตอบ</div>';
+  return `${ADMIN_STYLE}<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>งานติดตาม</h1><p class="muted">Lead ใหม่ ${unreadCount} รายการ · บทสนทนาที่รอทีมตอบ ${waitingLeads.length} รายการ</p></div></div><section class="triage-grid" aria-label="งานที่ต้องติดตาม"><article class="card triage-panel"><div class="section-heading"><div><div class="eyebrow">NOTIFICATIONS</div><h2>Lead ใหม่ <span class="count-pill">${unreadCount}</span></h2><p>รายการใหม่ที่ยังไม่ได้อ่าน</p></div></div><div class="triage-list">${notificationRows}</div></article><article class="card triage-panel"><div class="section-heading"><div><div class="eyebrow">FOLLOW UP</div><h2>รอตอบ <span class="count-pill">${waitingLeads.length}</span></h2><p>เรียงจากลูกค้าที่รอนานที่สุด</p></div></div><div class="triage-list">${waitingRows}</div></article></section>`;
+}
 
-  const visibleLeads = leads.slice(0, 100);
-  const messagesByConversation = new Map();
-  for (const lead of visibleLeads) {
-    const { rows } = await db.query('SELECT id, direction, body, created_at, send_status, last_error FROM messages WHERE conversation_id = $1 ORDER BY id DESC LIMIT 30', [lead.conversation_id]);
-    messagesByConversation.set(String(lead.conversation_id), rows.reverse());
-  }
-  const unreadNotificationCount = Number(unreadCountRows[0]?.count || 0);
-  const search = typeof query.q === 'string' ? query.q.trim().toLocaleLowerCase() : '';
-  const modeFilter = ['BOT', 'HUMAN'].includes(query.mode) ? query.mode : '';
-  const statusFilter = ['NEW', 'QUALIFYING', 'QUALIFIED', 'HUMAN_REQUIRED'].includes(query.status) ? query.status : '';
-  const filteredLeads = visibleLeads.filter((lead) => {
-    const messages = messagesByConversation.get(String(lead.conversation_id)) || [];
-    const requirements = lead.requirements_json || {};
-    const haystack = [lead.display_name, lead.line_user_id, lead.status, lead.current_step, ...Object.entries(requirements).flat(), ...messages.map((message) => readMessage(message.body))].join(' ').toLocaleLowerCase();
-    return (!search || haystack.includes(search)) && (!modeFilter || lead.mode === modeFilter) && (!statusFilter || lead.status === statusFilter);
-  });
-  const requestedId = typeof query.conversation === 'string' ? query.conversation : '';
-  const selected = filteredLeads.find((lead) => String(lead.conversation_id) === requestedId)
-    || waitingLeads.find((lead) => String(lead.conversation_id) === requestedId)
-    || notifications.find((lead) => String(lead.conversation_id) === requestedId)
-    || leads.find((lead) => String(lead.conversation_id) === requestedId)
-    || filteredLeads[0];
-  if (selected && !messagesByConversation.has(String(selected.conversation_id))) {
-    const { rows } = await db.query('SELECT id, direction, body, created_at, send_status, last_error FROM messages WHERE conversation_id = $1 ORDER BY id DESC LIMIT 30', [selected.conversation_id]);
-    messagesByConversation.set(String(selected.conversation_id), rows.reverse());
-  }
-  const selectedMessages = selected ? (messagesByConversation.get(String(selected.conversation_id)) || []) : [];
-  const today = bangkokToday();
-  const selectedQuotations = selected ? (await db.query('SELECT id, number, revision, status, valid_until, total_satang FROM quotations WHERE conversation_id = $1 ORDER BY created_at DESC, id DESC LIMIT 10', [selected.conversation_id])).rows.map(normalizeQuotation) : [];
-  const selectedRequirements = selected?.requirements_json || {};
-  const statusLabels = { NEW: 'ลูกค้าใหม่', QUALIFYING: 'กำลังเก็บข้อมูล', QUALIFIED: 'คัดกรองแล้ว', HUMAN_REQUIRED: 'รอพนักงาน' };
-  const stepLabels = { serviceType: 'ประเภทงาน', projectSummary: 'รายละเอียดโปรเจกต์', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ', complete: 'เก็บข้อมูลครบแล้ว' };
-  const requirementLabels = { serviceType: 'ประเภทงาน', projectSummary: 'รายละเอียดโปรเจกต์', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ' };
-  const selectedHref = (lead) => `/admin?${new URLSearchParams({ ...(search ? { q: query.q.trim() } : {}), ...(modeFilter ? { mode: modeFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), conversation: String(lead.conversation_id) }).toString()}#inbox`;
-  const leadRows = filteredLeads.map((lead) => {
-    const messages = messagesByConversation.get(String(lead.conversation_id)) || [];
-    const lastMessage = messages[messages.length - 1];
-    const requirements = lead.requirements_json || {};
-    const summary = lastMessage ? readMessage(lastMessage.body) : Object.values(requirements)[0] || 'เริ่มต้นบทสนทนา';
-    const modeLabel = lead.mode === 'HUMAN' ? 'รอทีมตอบ' : 'บอตดูแล';
-    return `<a class="lead-link${selected && String(selected.conversation_id) === String(lead.conversation_id) ? ' selected' : ''}" href="${selectedHref(lead)}"><div class="lead-link-top"><div class="profile-identity">${profileAvatar(lead, 34)}<span><strong>${escapeHtml(lead.display_name || lead.line_user_id)}</strong><small>${escapeHtml(lead.line_user_id)}</small></span></div><span class="mode-tag ${lead.mode === 'HUMAN' ? 'human' : 'bot'}">${modeLabel}</span></div><div class="lead-meta"><span>${escapeHtml(statusLabels[lead.status] || lead.status)}</span><span>·</span><span>${escapeHtml(stepLabels[lead.current_step] || lead.current_step)}</span></div><div class="lead-preview">${escapeHtml(summary)}</div></a>`;
-  }).join('');
-  const notificationRows = notifications.map((notification) => `<article class="triage-item"><div class="triage-item-top"><strong>${escapeHtml(notification.display_name || notification.line_user_id)}</strong><time>${escapeHtml(formatAdminDateTime(notification.created_at))}</time></div><div class="lead-meta">มี lead ใหม่จาก LINE</div><div class="triage-actions"><a class="button secondary" href="/admin?conversation=${encodeURIComponent(notification.conversation_id)}#inbox">เปิดบทสนทนา</a><form method="post" action="/admin/notifications/${encodeURIComponent(notification.id)}/read"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ทำเครื่องหมายว่าอ่านแล้ว</button></form></div></article>`).join('') || '<div class="empty-state triage-empty">ยังไม่มี lead ใหม่ที่ยังไม่ได้อ่าน</div>';
-  const waitingRows = waitingLeads.map((lead) => {
-    const summary = readMessage(lead.waiting_body);
-    return `<a class="triage-item waiting-item" href="/admin?conversation=${encodeURIComponent(lead.conversation_id)}#inbox"><div class="triage-item-top"><strong>${escapeHtml(lead.display_name || lead.line_user_id)}</strong><span class="wait-time">รอ ${escapeHtml(formatElapsed(lead.waiting_since))}</span></div><div class="lead-meta">ข้อความล่าสุดจากลูกค้า · ${escapeHtml(formatAdminDateTime(lead.waiting_since))}</div><div class="lead-preview">${escapeHtml(summary)}</div></a>`;
-  }).join('') || '<div class="empty-state triage-empty">ไม่มีบทสนทนาที่รอคำตอบ</div>';
-  const requirementRows = Object.entries(selectedRequirements).map(([key, value]) => `<div class="requirement"><b>${escapeHtml(requirementLabels[key] || key)}</b>${escapeHtml(value)}</div>`).join('') || '<p class="muted" style="font-size:13px">ยังไม่มีข้อมูลจากแบบสอบถาม</p>';
-  const messageBubbles = selectedMessages.map((message) => {
-    const pending = message.direction === 'OUT' && !['SENT', 'CANCELLED'].includes(message.send_status);
-    const delivery = pending ? ` · ${escapeHtml(message.send_status)}${message.last_error ? ` (${escapeHtml(message.last_error)})` : ''}` : '';
-    return `<div class="message ${message.direction === 'IN' ? 'in' : 'out'}"><div class="message-meta">${message.direction === 'IN' ? 'ลูกค้า' : 'Donnar.Tech'} · ${escapeHtml(formatAdminDateTime(message.created_at))}${delivery}</div>${escapeHtml(readMessage(message.body))}</div>`;
-  }).join('');
-  const profileStatusText = { updated: 'อัปเดตรูปจาก LINE แล้ว', unavailable: 'LINE ยังไม่มีรูปโปรไฟล์ให้แสดง', failed: 'โหลดโปรไฟล์ไม่สำเร็จ ลองใหม่ได้', cached: 'ใช้ข้อมูลโปรไฟล์ที่บันทึกไว้' }[profileRefreshResult];
-  const profileStatus = selected && !safeProfilePictureUrl(selected.picture_url)
-    ? `<div class="profile-status"><span>${escapeHtml(profileStatusText || (selected.profile_synced_at ? 'LINE ยังไม่มีรูปโปรไฟล์ให้แสดง' : 'ยังไม่พบรูปโปรไฟล์ LINE'))}</span><form method="post" action="/admin/conversations/${selected.conversation_id}/profile/refresh"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ลองโหลดรูปใหม่</button></form></div>`
-    : '';
-  const detail = selected ? `<section class="inbox-detail"><div class="detail-head"><div class="profile-identity profile-header">${profileAvatar(selected, 48)}<span><h2>${escapeHtml(selected.display_name || selected.line_user_id)}</h2><div class="muted" style="font-size:13px">LINE UID: ${escapeHtml(selected.line_user_id)}</div><div style="margin-top:9px"><span class="tag">${escapeHtml(statusLabels[selected.status] || selected.status)}</span> <span class="mode-tag ${selected.mode === 'HUMAN' ? 'human' : 'bot'}">${selected.mode === 'HUMAN' ? 'พนักงานดูแล' : 'บอตดูแล'}</span></div>${profileStatus}</span></div><form method="post" action="/admin/conversations/${selected.conversation_id}/mode"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="mode" value="${selected.mode === 'BOT' ? 'HUMAN' : 'BOT'}"><button class="${selected.mode === 'BOT' ? '' : 'secondary'}">${selected.mode === 'BOT' ? 'รับช่วงตอบลูกค้า' : 'ส่งคืนให้บอต'}</button></form></div><div class="detail-grid"><div class="message-history" id="message-history">${messageBubbles || '<div class="empty-state"><div class="empty-icon">💬</div>ยังไม่มีข้อความในบทสนทนา</div>'}</div><aside class="lead-details"><div class="detail-label">รายละเอียดโปรเจกต์</div>${requirementRows}<div class="requirement"><b>ขั้นตอนปัจจุบัน</b>${escapeHtml(stepLabels[selected.current_step] || selected.current_step)}</div><div class="requirement"><b>สถานะ Lead</b>${escapeHtml(statusLabels[selected.status] || selected.status)}</div>${conversationQuotationPanel({ quotations: selectedQuotations, conversationId: selected.conversation_id, csrfToken, today })}</aside></div><div class="composer">${selected.mode === 'HUMAN' ? `<form method="post" action="/admin/conversations/${selected.conversation_id}/reply"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><textarea name="text" maxlength="2000" placeholder="พิมพ์ข้อความตอบลูกค้า…" aria-label="ข้อความตอบลูกค้า" required></textarea><button type="submit">ส่งข้อความ <span aria-hidden="true">➤</span></button></form><p class="composer-help">กด “ส่งคืนให้บอต” เมื่อพร้อมให้บอตดูแลบทสนทนาต่อ</p>` : '<div class="danger-note">บอตกำลังดูแลบทสนทนานี้ หากต้องการตอบลูกค้า ให้กด “รับช่วงตอบลูกค้า” ก่อน</div>'}</div></section>` : '<section class="inbox-detail empty-state"><div class="empty-icon">🔎</div><h2>ไม่พบ lead ที่ตรงกับตัวกรอง</h2><p>ลองเปลี่ยนคำค้นหาหรือล้างตัวกรอง</p></section>';
+async function contentPage(db, csrfToken) {
+  const { rows: revisions } = await db.query('SELECT * FROM message_revisions ORDER BY message_key, revision DESC');
   const publishedCopy = new Map(revisions.filter((item) => item.status === 'PUBLISHED').map((item) => [item.message_key, item.body]));
-  const contentForms = Object.keys(DEFAULT_COPY).map((key) => `<div class="revision-card"><h3>${escapeHtml(key)}</h3><form method="post" action="/admin/content/draft"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="key" value="${escapeHtml(key)}"><textarea name="body" required>${escapeHtml(publishedCopy.get(key) || DEFAULT_COPY[key])}</textarea><button class="secondary">บันทึกฉบับร่าง</button></form></div>`).join('');
-  const drafts = revisions.filter((item) => item.status === 'DRAFT').map((item) => `<article class="revision-card"><b>${escapeHtml(item.message_key)} · r${item.revision}</b><p>${escapeHtml(item.body)}</p><form method="post" action="/admin/content/${item.id}/publish"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button>เผยแพร่ฉบับนี้</button></form></article>`).join('') || '<p class="muted">ไม่มีฉบับร่าง</p>';
+  const contentForms = Object.keys(DEFAULT_COPY).map((key) => `<div class="revision-card"><h3>${escapeHtml(key)}</h3><form method="post" action="/admin/content/draft"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="key" value="${escapeHtml(key)}"><textarea name="body" required>${escapeHtml(publishedCopy.get(key) || DEFAULT_COPY[key])}</textarea><button class="secondary" type="submit">บันทึกฉบับร่าง</button></form></div>`).join('');
+  const drafts = revisions.filter((item) => item.status === 'DRAFT').map((item) => `<article class="revision-card"><b>${escapeHtml(item.message_key)} · r${item.revision}</b><p>${escapeHtml(item.body)}</p><form method="post" action="/admin/content/${item.id}/publish"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button type="submit">เผยแพร่ฉบับนี้</button></form></article>`).join('') || '<p class="muted">ไม่มีฉบับร่าง</p>';
+  return `${ADMIN_STYLE}<div class="crm-top"><div><div class="eyebrow">CONTENT</div><h1>ข้อความบอต</h1><p class="muted">แก้ข้อความและบันทึกเป็นฉบับร่าง ก่อนกดเผยแพร่</p></div></div><div class="grid">${contentForms}</div><div class="section-heading"><div><h2>ฉบับร่างที่รอเผยแพร่</h2></div></div><div class="grid">${drafts}</div>`;
+}
+
+async function richMenuPage(db, csrfToken) {
+  const { rows: menus } = await db.query('SELECT id, line_menu_id, image_uploaded, image_content_type, status, created_at, published_at FROM rich_menu_publications ORDER BY id DESC LIMIT 10');
   const activeMenus = menus.filter((menu) => ['DRAFT', 'FAILED'].includes(menu.status) && menu.image_content_type);
   const publishedMenus = menus.filter((menu) => menu.status === 'PUBLISHED');
-  const richMenuPanel = `<section class="card" id="rich-menu"><div class="section-heading" style="margin-top:0"><div><div class="eyebrow">LINE OA</div><h2>Rich Menu</h2><p>อัปโหลดภาพเพื่อดูตัวอย่าง แล้วกดยืนยันเมื่อพร้อมเปลี่ยนเมนูใน LINE OA</p></div></div><form class="menu-upload" method="post" action="/admin/rich-menu/draft" enctype="multipart/form-data"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><label for="rich-menu-image">ภาพ Rich Menu (JPEG หรือ PNG)</label><input id="rich-menu-image" type="file" name="image" accept="image/jpeg,image/png" required><small>ขนาด 2500 × 1686 พิกเซล และไม่เกิน 1 MB · ภาพจะไม่ถูกครอปหรือปรับขนาด</small><button type="submit">อัปโหลดและดูตัวอย่าง</button></form><div class="danger-note" style="margin:14px 0">การอัปโหลดและดูตัวอย่างยังไม่เปลี่ยนเมนูปัจจุบัน เมนูจะเปลี่ยนเมื่อกดปุ่มยืนยันด้านล่างเท่านั้น</div><h3>เมนูที่ใช้อยู่</h3>${publishedMenus.map((menu) => `<div class="requirement"><b>${escapeHtml(menu.status)}</b>LINE menu ID: ${escapeHtml(menu.line_menu_id || 'ไม่ทราบ')}${menu.image_content_type ? `<img class="rich-menu-preview" src="/admin/rich-menu/image/${menu.id}" alt="Rich Menu ปัจจุบัน">` : '<p class="muted">เมนูเดิมไม่มีภาพในคลังของหลังบ้าน</p>'}</div>`).join('') || '<p class="muted">ยังไม่มีเมนูที่เผยแพร่</p>'}${activeMenus.map((menu) => `<article class="revision-card menu-draft"><h3>${menu.status === 'DRAFT' ? 'ตัวอย่างที่รอการยืนยัน' : 'เผยแพร่ไม่สำเร็จ · พร้อมลองอีกครั้ง'}</h3><img class="rich-menu-preview" src="/admin/rich-menu/image/${menu.id}" alt="ตัวอย่างภาพ Rich Menu ที่อัปโหลด"><p class="muted">ยืนยันเพื่อใช้ภาพนี้แทน Rich Menu default ใน LINE OA</p><div class="actions"><form method="post" action="/admin/rich-menu/publish"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="publication_id" value="${menu.id}"><button type="submit">${menu.status === 'DRAFT' ? 'ยืนยันเปลี่ยน Rich Menu' : 'ลองเผยแพร่อีกครั้ง'}</button></form>${menu.status === 'DRAFT' ? `<form method="post" action="/admin/rich-menu/draft/${menu.id}/cancel"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ยกเลิกภาพนี้</button></form>` : ''}</div></article>`).join('')}${menus.filter((menu) => menu.status === 'CREATING').map((menu) => '<p class="tag">กำลังเผยแพร่ Rich Menu…</p>').join('')}</section>`;
-  const stats = [
-    { label: 'Lead 100 รายล่าสุด', count: visibleLeads.length, tone: 'blue' },
-    { label: 'รอทีมดูแล', count: leads.filter((lead) => lead.mode === 'HUMAN').length, tone: 'orange' },
-    { label: 'ผ่านการคัดกรอง', count: leads.filter((lead) => lead.status === 'QUALIFIED').length, tone: 'green' },
-  ].map((item) => `<div class="metric ${item.tone}"><span>${item.label}</span><strong>${item.count}</strong></div>`).join('');
-  const emptyLeads = visibleLeads.length ? '<div class="empty-state"><div class="empty-icon">🔎</div>ไม่พบรายการที่ตรงกับตัวกรอง<br><a href="/admin#inbox">ล้างตัวกรอง</a></div>' : '<div class="empty-state"><div class="empty-icon">📭</div>ยังไม่มีบทสนทนา</div>';
-  const triagePanels = `<section class="triage-grid" aria-label="งานที่ต้องติดตาม"><article class="card triage-panel" id="new-leads"><div class="section-heading"><div><div class="eyebrow">NOTIFICATIONS</div><h2>Lead ใหม่ <span class="count-pill">${unreadNotificationCount}</span></h2><p>รายการใหม่ที่ยังไม่ได้อ่าน</p></div></div><div class="triage-list">${notificationRows}</div></article><article class="card triage-panel" id="waiting-replies"><div class="section-heading"><div><div class="eyebrow">FOLLOW UP</div><h2>รอตอบ <span class="count-pill">${waitingLeads.length}</span></h2><p>เรียงจากลูกค้าที่รอนานที่สุด</p></div></div><div class="triage-list">${waitingRows}</div></article></section>`;
-  return shell('CRM Inbox', `${ADMIN_STYLE}<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>กล่องข้อความ</h1><p class="muted">จัดการ lead และบทสนทนาจาก LINE ในหน้าเดียว · ค้นหาใน 100 รายการล่าสุด</p></div><div class="user-tools"><span class="muted">เข้าสู่ระบบเป็น <b>${escapeHtml(staff.username)}</b></span><form method="post" action="/admin/logout"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary">ออกจากระบบ</button></form></div></div><nav class="crm-nav"><a class="active" href="#inbox">กล่องข้อความ</a><a href="#new-leads">Lead ใหม่ (${unreadNotificationCount})</a><a href="#waiting-replies">รอตอบ (${waitingLeads.length})</a><a href="/admin/quotations">ใบเสนอราคา${quotationDecisions.length ? ` (${quotationDecisions.length})` : ''}</a><a href="#bot-content">ข้อความบอต</a><a href="#rich-menu">Rich Menu</a></nav><div class="metric-grid">${stats}</div>${decisionPanel({ decisions: quotationDecisions.map(normalizeQuotation), today })}${triagePanels}<section class="inbox" id="inbox"><aside class="inbox-sidebar"><div class="inbox-heading"><h2>บทสนทนา <span class="muted" style="font-size:13px;font-weight:500">(${filteredLeads.length})</span></h2></div><form method="get" action="/admin" class="filters"><input name="q" type="search" value="${escapeHtml(query.q || '')}" placeholder="ค้นหา UID, ข้อความ หรือรายละเอียด" aria-label="ค้นหา lead"><label for="mode-filter">สถานะการดูแล</label><select id="mode-filter" name="mode"><option value="">ทุกสถานะ</option><option value="BOT"${modeFilter === 'BOT' ? ' selected' : ''}>บอตดูแล</option><option value="HUMAN"${modeFilter === 'HUMAN' ? ' selected' : ''}>รอทีมตอบ</option></select><label for="lead-status-filter">สถานะ lead</label><select id="lead-status-filter" name="status"><option value="">ทั้งหมด</option><option value="NEW"${statusFilter === 'NEW' ? ' selected' : ''}>ใหม่</option><option value="QUALIFYING"${statusFilter === 'QUALIFYING' ? ' selected' : ''}>กำลังเก็บข้อมูล</option><option value="QUALIFIED"${statusFilter === 'QUALIFIED' ? ' selected' : ''}>คัดกรองแล้ว</option><option value="HUMAN_REQUIRED"${statusFilter === 'HUMAN_REQUIRED' ? ' selected' : ''}>ต้องการทีมดูแล</option></select><button type="submit" class="secondary" style="width:100%">ค้นหา / กรอง</button></form><div class="lead-list">${leadRows || emptyLeads}</div></aside>${detail}</section><section id="bot-content"><div class="section-heading"><div><div class="eyebrow">CONTENT</div><h2>ข้อความบอต</h2><p>แก้ข้อความและบันทึกเป็นฉบับร่าง ก่อนกดเผยแพร่</p></div></div><div class="grid">${contentForms}</div><div class="section-heading"><div><h3>ฉบับร่างที่รอเผยแพร่</h3></div></div><div class="grid">${drafts}</div></section>${richMenuPanel}`);
+  const publishedMarkup = publishedMenus.map((menu) => `<div class="requirement"><b>${escapeHtml(menu.status)}</b>LINE menu ID: ${escapeHtml(menu.line_menu_id || 'ไม่ทราบ')}${menu.image_content_type ? `<img class="rich-menu-preview" src="/admin/rich-menu/image/${menu.id}" alt="Rich Menu ปัจจุบัน">` : '<p class="muted">เมนูเดิมไม่มีภาพในคลังของหลังบ้าน</p>'}</div>`).join('') || '<p class="muted">ยังไม่มีเมนูที่เผยแพร่</p>';
+  const draftMarkup = activeMenus.map((menu) => `<article class="revision-card menu-draft"><h3>${menu.status === 'DRAFT' ? 'ตัวอย่างที่รอการยืนยัน' : 'เผยแพร่ไม่สำเร็จ · พร้อมลองอีกครั้ง'}</h3><img class="rich-menu-preview" src="/admin/rich-menu/image/${menu.id}" alt="ตัวอย่างภาพ Rich Menu ที่อัปโหลด"><p class="muted">ยืนยันเพื่อใช้ภาพนี้แทน Rich Menu default ใน LINE OA</p><div class="actions"><form method="post" action="/admin/rich-menu/publish"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="publication_id" value="${menu.id}"><button type="submit">${menu.status === 'DRAFT' ? 'ยืนยันเปลี่ยน Rich Menu' : 'ลองเผยแพร่อีกครั้ง'}</button></form>${menu.status === 'DRAFT' ? `<form method="post" action="/admin/rich-menu/draft/${menu.id}/cancel"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ยกเลิกภาพนี้</button></form>` : ''}</div></article>`).join('');
+  const creatingMarkup = menus.filter((menu) => menu.status === 'CREATING').map(() => '<p class="tag">กำลังเผยแพร่ Rich Menu…</p>').join('');
+  return `${ADMIN_STYLE}<section class="card"><div class="section-heading" style="margin-top:0"><div><div class="eyebrow">LINE OA</div><h1>Rich Menu</h1><p>อัปโหลดภาพเพื่อดูตัวอย่าง แล้วกดยืนยันเมื่อพร้อมเปลี่ยนเมนูใน LINE OA</p></div></div><form class="menu-upload" method="post" action="/admin/rich-menu/draft" enctype="multipart/form-data"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><label for="rich-menu-image">ภาพ Rich Menu (JPEG หรือ PNG)</label><input id="rich-menu-image" type="file" name="image" accept="image/jpeg,image/png" required><small>ขนาด 2500 × 1686 พิกเซล และไม่เกิน 1 MB · ภาพจะไม่ถูกครอปหรือปรับขนาด</small><button type="submit">อัปโหลดและดูตัวอย่าง</button></form><div class="danger-note" style="margin:14px 0">การอัปโหลดและดูตัวอย่างยังไม่เปลี่ยนเมนูปัจจุบัน เมนูจะเปลี่ยนเมื่อกดปุ่มยืนยันด้านล่างเท่านั้น</div><h2>เมนูที่ใช้อยู่</h2>${publishedMarkup}${draftMarkup}${creatingMarkup}</section>`;
 }
 
 function readMessage(body) {

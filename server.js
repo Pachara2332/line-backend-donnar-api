@@ -38,6 +38,7 @@ async function main() {
       shuttingDown = true;
       const timeout = setTimeout(() => process.exit(1), 10000).unref();
       const workersStopped = Promise.all([emailWorker?.stop(), discordWorker?.stop()]);
+      app.locals.closeInboxStreams?.();
       server.close(async () => {
         await workersStopped;
         await db.end();
