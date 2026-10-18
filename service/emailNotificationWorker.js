@@ -11,11 +11,13 @@ function createEmailNotificationWorker({ db, emailClient, fromEmail, recipient, 
   async function claim() {
     return withTransaction(db, async (client) => {
       const { rows } = await client.query(`SELECT n.id, n.conversation_id, n.attempts, n.email_payload, m.body, m.message_type, m.created_at,
-        c.line_user_id, COALESCE(NULLIF(u.display_name, ''), c.line_user_id) AS display_name
+        c.channel, COALESCE(c.line_user_id, c.messenger_user_id) AS channel_user_id,
+        COALESCE(NULLIF(lu.display_name, ''), NULLIF(mu.display_name, ''), c.line_user_id, c.messenger_user_id) AS display_name
         FROM line_chat_email_notifications n
         JOIN messages m ON m.id = n.message_id AND m.conversation_id = n.conversation_id
         JOIN conversations c ON c.id = n.conversation_id
-        JOIN line_users u ON u.line_user_id = c.line_user_id
+        LEFT JOIN line_users lu ON lu.line_user_id = c.line_user_id
+        LEFT JOIN messenger_users mu ON mu.messenger_user_id = c.messenger_user_id
         WHERE n.status = 'PENDING' AND n.next_attempt_at <= CURRENT_TIMESTAMP
         ORDER BY n.next_attempt_at, n.id LIMIT 1 FOR UPDATE OF n SKIP LOCKED`);
       const job = rows[0];
@@ -25,7 +27,7 @@ function createEmailNotificationWorker({ db, emailClient, fromEmail, recipient, 
       if (!emailPayload) {
         try {
           if (!fromEmail || !recipient) throw Object.assign(new Error('email_configuration'), { category: 'email_configuration', retryable: false });
-          const email = buildChatNotificationEmail({ baseUrl: publicBaseUrl, conversationId: job.conversation_id, displayName: job.display_name, lineUserId: job.line_user_id, messageType: job.message_type, body: job.body, createdAt: job.created_at });
+          const email = buildChatNotificationEmail({ baseUrl: publicBaseUrl, conversationId: job.conversation_id, channel: job.channel, displayName: job.display_name, channelUserId: job.channel_user_id, messageType: job.message_type, body: job.body, createdAt: job.created_at });
           emailPayload = { from: fromEmail, to: [recipient], ...email };
         } catch (error) {
           contentError = error;

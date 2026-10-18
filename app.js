@@ -7,6 +7,7 @@ const path = require('node:path');
 const { Writable } = require('node:stream');
 const { formidable } = require('formidable');
 const { createLineSignatureMiddleware } = require('./middleware/webhookValidation');
+const { createMessengerSignatureMiddleware } = require('./middleware/messengerWebhookValidation');
 const { createConversationService } = require('./service/conversationService');
 const { DEFAULT_COPY } = require('./service/messageCatalog');
 const { withTransaction } = require('./database');
@@ -16,8 +17,10 @@ const { createQuotationService, parseQuotationForm, normalizeQuotation, bangkokT
 const { renderQuotationPdf } = require('./service/quotationPdf');
 const { ADMIN_STYLE, quotationListPage, quotationEditorPage, quotationViewPage, conversationQuotationPanel, publicQuotationPage, publicNotFoundPage, editorModel, formModel } = require('./service/quotationPages');
 const { buildQuotationCard } = require('./service/responseCards');
+const { buildMessengerQuotation, persistentMenu } = require('./service/messengerResponses');
+const { messengerMenuPage } = require('./service/messengerMenu');
 
-function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
+function buildApp({ db, lineClient, messengerClient = null, config, verifyLiffToken = verifyIdToken }) {
   const app = express();
   const inboxStreams = new Set();
   const inboxEventHistory = [];
@@ -47,12 +50,14 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     for (const stream of inboxStreams) stream.end();
     inboxStreams.clear();
   };
-  const conversations = createConversationService({ db, lineClient, liffId: config.liffId, emailNotificationsEnabled: config.emailNotificationsEnabled, discordNotificationsEnabled: config.discordNotificationsEnabled, onInboxUpdate: publishInboxUpdate });
+  const conversations = createConversationService({ db, lineClient, messengerClient, messengerPageId: config.messengerPageId, liffId: config.liffId, emailNotificationsEnabled: config.emailNotificationsEnabled, discordNotificationsEnabled: config.discordNotificationsEnabled, onInboxUpdate: publishInboxUpdate });
   const seller = config.seller || {};
   const quotations = createQuotationService({ db, seller });
   app.locals.lineClient = lineClient;
+  app.locals.messengerClient = messengerClient;
 
   async function deliverPush(conversation, message) {
+    if (conversation.channel === 'FACEBOOK') return conversations.sendMessageToConversation(conversation.id, message);
     const { rows: outgoingRows } = await db.query("INSERT INTO messages(conversation_id, direction, message_type, body, send_status, attempts) VALUES ($1, 'OUT', $2, $3, 'SENDING', 1) RETURNING id", [conversation.id, message.type, JSON.stringify(message)]);
     const outgoingId = outgoingRows[0].id;
     try {
@@ -70,15 +75,17 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
   const quotationLink = (token) => `${String(config.publicBaseUrl || '').replace(/\/$/, '')}/q/${token}`;
 
   async function pushQuotationCard(quotation) {
-    const { rows } = await db.query('SELECT id, line_user_id FROM conversations WHERE id = $1', [quotation.conversation_id]);
-    if (!rows[0]) return false;
-    const card = buildQuotationCard({ label: quotationLabel(quotation), title: quotation.title, total: formatMoney(quotation.total_satang), validUntil: formatThaiDate(quotation.valid_until), url: quotationLink(quotation.public_token) });
+    const { rows } = await db.query('SELECT id, channel, line_user_id, messenger_user_id FROM conversations WHERE id = $1', [quotation.conversation_id]);
+    if (!rows[0]) return { delivered: false, windowExpired: false };
+    const card = rows[0].channel === 'FACEBOOK'
+      ? buildMessengerQuotation({ label: quotationLabel(quotation), title: quotation.title, total: formatMoney(quotation.total_satang), validUntil: formatThaiDate(quotation.valid_until), url: quotationLink(quotation.public_token) })
+      : buildQuotationCard({ label: quotationLabel(quotation), title: quotation.title, total: formatMoney(quotation.total_satang), validUntil: formatThaiDate(quotation.valid_until), url: quotationLink(quotation.public_token) });
     try {
-      await deliverPush(rows[0], card);
-      return true;
+      const result = await deliverPush(rows[0], card);
+      return { delivered: result?.outcome !== 'window_expired', windowExpired: result?.outcome === 'window_expired' };
     } catch (error) {
       console.error('quotation card delivery failed', { quotationId: quotation.id, status: error.status || null });
-      return false;
+      return { delivered: false, windowExpired: false };
     }
   }
 
@@ -127,12 +134,13 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       const token = String(req.params.token || '');
       const loaded = /^[A-Za-z0-9_-]{43}$/.test(token) ? await quotations.loadByToken(token) : null;
       if (!loaded || loaded.quotation.status === 'DRAFT') return res.status(404).type('html').send(publicNotFoundPage());
-      req.quotation = loaded;
+      const { rows: channels } = await db.query('SELECT c.channel FROM quotations q JOIN conversations c ON c.id = q.conversation_id WHERE q.public_token = $1', [token]);
+      req.quotation = { ...loaded, channel: channels[0]?.channel || 'LINE' };
       req.quotationToken = token;
       return next();
     } catch (error) { return next(error); }
   };
-  app.get('/q/:token', publicQuotationLimit, loadPublicQuotation, (req, res) => res.type('html').send(publicQuotationPage({ ...req.quotation, token: req.quotationToken, today: bangkokToday() })));
+  app.get('/q/:token', publicQuotationLimit, loadPublicQuotation, (req, res) => res.type('html').send(publicQuotationPage({ ...req.quotation, token: req.quotationToken, today: bangkokToday(), channel: req.quotation.channel })));
   app.get('/q/:token/pdf', publicQuotationLimit, loadPublicQuotation, async (req, res, next) => {
     try { return await sendQuotationPdf(res, req.quotation.quotation, req.quotation.items, 'inline'); } catch (error) { return next(error); }
   });
@@ -145,7 +153,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       const invalid = decision === 'accept'
         ? (!name || name.length > 120 ? 'กรอกชื่อผู้อนุมัติ (ไม่เกิน 120 ตัวอักษร)' : (req.body?.agree !== 'on' ? 'กรุณาทำเครื่องหมายยอมรับเงื่อนไขก่อนยืนยัน' : ''))
         : (reason.length > 1000 ? 'เหตุผลยาวเกิน 1,000 ตัวอักษร' : '');
-      if (invalid) return res.status(400).type('html').send(publicQuotationPage({ ...req.quotation, token: req.quotationToken, today: bangkokToday(), error: invalid }));
+      if (invalid) return res.status(400).type('html').send(publicQuotationPage({ ...req.quotation, token: req.quotationToken, today: bangkokToday(), channel: req.quotation.channel, error: invalid }));
       await quotations.decide(req.quotationToken, decision, decision === 'accept' ? name : null, decision === 'reject' ? reason : null);
       return res.redirect(303, `/q/${req.quotationToken}`);
     } catch (error) { return next(error); }
@@ -171,19 +179,65 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     }
   });
 
-  app.get('/admin/login', (req, res) => res.type('html').send(loginPage('', req.query.conversation)));
+  app.get('/webhooks/messenger', (req, res) => {
+    const mode = req.query['hub.mode'];
+    const verifyToken = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+    if (!config.messengerEnabled || mode !== 'subscribe' || verifyToken !== config.messengerWebhookVerifyToken || typeof challenge !== 'string' || challenge.length > 1024) return res.sendStatus(403);
+    return res.type('text').send(challenge);
+  });
+  app.post('/webhooks/messenger', (req, res, next) => config.messengerEnabled ? next() : res.sendStatus(404), express.raw({ type: 'application/json', limit: '1mb' }), createMessengerSignatureMiddleware(config.messengerAppSecret), async (req, res, next) => {
+    let payload;
+    try { payload = JSON.parse(req.body.toString('utf8')); }
+    catch { return res.status(400).json({ error: 'Malformed webhook JSON' }); }
+    if (!payload || payload.object !== 'page' || !Array.isArray(payload.entry) || payload.entry.length > 100) return res.status(400).json({ error: 'Invalid Messenger webhook envelope' });
+    const events = [];
+    for (const entry of payload.entry) {
+      if (!entry || entry.id !== config.messengerPageId || !Array.isArray(entry.messaging) || entry.messaging.length > 100) return res.status(400).json({ error: 'Invalid Messenger webhook entry' });
+      for (const item of entry.messaging) {
+        if (!item || !item.sender || typeof item.sender.id !== 'string' || !item.sender.id || !item.recipient || typeof item.recipient.id !== 'string' || !Number.isFinite(item.timestamp) || item.timestamp <= 0) return res.status(400).json({ error: 'Invalid Messenger event shape' });
+        if (item.message !== undefined && (!item.message || typeof item.message !== 'object' || Array.isArray(item.message))) return res.status(400).json({ error: 'Invalid Messenger message' });
+        if (item.message?.is_echo) continue;
+        if (item.recipient.id !== config.messengerPageId) return res.status(400).json({ error: 'Invalid Messenger event recipient' });
+        if (item.message) {
+          if (item.message.mid !== undefined && (typeof item.message.mid !== 'string' || !item.message.mid || item.message.mid.length > 512)) return res.status(400).json({ error: 'Invalid Messenger message ID' });
+          if (item.message.text !== undefined && (typeof item.message.text !== 'string' || item.message.text.length > 10000)) return res.status(400).json({ error: 'Invalid Messenger message text' });
+          if (item.message.attachments !== undefined && (!Array.isArray(item.message.attachments) || item.message.attachments.length > 20 || item.message.attachments.some((attachment) => !attachment || typeof attachment !== 'object' || Array.isArray(attachment)))) return res.status(400).json({ error: 'Invalid Messenger attachments' });
+          if (item.message.quick_reply !== undefined && (!item.message.quick_reply || typeof item.message.quick_reply !== 'object' || Array.isArray(item.message.quick_reply))) return res.status(400).json({ error: 'Invalid Messenger quick reply' });
+          if (item.message.quick_reply?.payload !== undefined && (typeof item.message.quick_reply.payload !== 'string' || item.message.quick_reply.payload.length > 1000)) return res.status(400).json({ error: 'Invalid Messenger quick reply' });
+          const attachmentType = item.message.attachments?.[0]?.type;
+          const messageType = typeof item.message.text === 'string' ? 'text' : (['image', 'video', 'audio', 'file', 'location', 'sticker'].includes(attachmentType) ? attachmentType : 'unknown');
+          const seed = JSON.stringify(item);
+          events.push({ channel: 'FACEBOOK', pageId: entry.id, providerEventId: item.message.mid || createHash('sha256').update(seed).digest('hex'), userId: item.sender.id, type: 'message', text: item.message.text || '', payload: item.message.quick_reply?.payload || '', messageType, occurredAt: item.timestamp });
+          continue;
+        }
+        if (item.postback !== undefined && (!item.postback || typeof item.postback !== 'object' || Array.isArray(item.postback) || typeof item.postback.payload !== 'string' || item.postback.payload.length > 1000)) return res.status(400).json({ error: 'Invalid Messenger postback' });
+        if (item.postback) {
+          const seed = JSON.stringify(item);
+          events.push({ channel: 'FACEBOOK', pageId: entry.id, providerEventId: createHash('sha256').update(seed).digest('hex'), userId: item.sender.id, type: 'postback', text: '', payload: item.postback.payload, messageType: 'postback', occurredAt: item.timestamp });
+        }
+      }
+    }
+    try {
+      for (const event of events) await conversations.processMessengerEvent(event);
+      return res.status(200).json({ accepted: true, processed: events.length });
+    } catch (error) { return next(error); }
+  });
+
+  app.get('/admin/login', (req, res) => res.type('html').send(loginPage('', req.query.conversation, req.query.channel)));
   app.post('/admin/login', express.urlencoded({ extended: false, limit: '10kb' }), rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false }), async (req, res, next) => {
     try {
     const conversationId = typeof req.body.conversation === 'string' ? positiveId(req.body.conversation) : null;
+    const channel = req.body.channel === 'FACEBOOK' ? 'FACEBOOK' : 'LINE';
     const { rows: staffRows } = await db.query('SELECT username, password_hash FROM staff_users WHERE username = $1', [String(req.body.username || '')]);
     const staff = staffRows[0];
-    if (!staff || !verifyPassword(String(req.body.password || ''), staff.password_hash)) return res.status(401).type('html').send(loginPage('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง', req.body.conversation));
+    if (!staff || !verifyPassword(String(req.body.password || ''), staff.password_hash)) return res.status(401).type('html').send(loginPage('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง', req.body.conversation, channel));
     const token = randomBytes(32).toString('base64url');
     const csrf = randomBytes(24).toString('base64url');
     await db.query('DELETE FROM staff_sessions WHERE expires_at < NOW()');
     await db.query("INSERT INTO staff_sessions(session_hash, username, csrf_token, expires_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP + INTERVAL '12 hours')", [hashToken(token), staff.username, csrf]);
     res.setHeader('Set-Cookie', sessionCookie(token, config.isProduction));
-    res.redirect(303, conversationId ? `/admin/inbox?conversation=${conversationId}` : '/admin');
+    res.redirect(303, conversationId ? `/admin/inbox?channel=${channel}&conversation=${conversationId}` : '/admin');
     } catch (error) { next(error); }
   });
 
@@ -230,11 +284,20 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     const conversationId = positiveId(req.params.id);
     if (!conversationId) return res.sendStatus(404);
     try {
-      const { rows: conversations } = await db.query(`SELECT c.id, c.mode, c.current_step, c.line_user_id, l.status, l.requirements_json, u.display_name, u.picture_url
-        FROM conversations c JOIN leads l ON l.conversation_id = c.id JOIN line_users u ON u.line_user_id = c.line_user_id
-        WHERE c.id = $1`, [conversationId]);
+      const channel = req.query.channel === 'FACEBOOK' ? 'FACEBOOK' : 'LINE';
+      const { rows: conversations } = await db.query(`SELECT c.id, c.channel, c.mode, c.current_step, c.line_user_id, c.messenger_user_id,
+        l.status, l.requirements_json, COALESCE(lu.display_name, mu.display_name) AS display_name,
+        COALESCE(lu.picture_url, mu.picture_url) AS picture_url, inbound.latest_customer_message_at
+        FROM conversations c JOIN leads l ON l.conversation_id = c.id
+        LEFT JOIN line_users lu ON lu.line_user_id = c.line_user_id
+        LEFT JOIN messenger_users mu ON mu.messenger_user_id = c.messenger_user_id
+        LEFT JOIN LATERAL (SELECT max(m.provider_timestamp) AS latest_customer_message_at FROM messages m WHERE m.conversation_id = c.id AND m.direction = 'IN') inbound ON TRUE
+        WHERE c.id = $1 AND c.channel = $2`, [conversationId, channel]);
       const conversation = conversations[0];
-      if (!conversation) return res.sendStatus(404);
+      if (!conversation) {
+        const { rows: existing } = await db.query('SELECT channel FROM conversations WHERE id = $1', [conversationId]);
+        return existing[0] && existing[0].channel !== channel ? res.status(204).end() : res.sendStatus(404);
+      }
       const messageLimit = req.query.messages === '1' ? 30 : 1;
       const { rows: messages } = await db.query(`SELECT id, direction, body, created_at, send_status, last_error FROM (
         SELECT id, direction, body, created_at, send_status, last_error FROM messages WHERE conversation_id = $1 ORDER BY id DESC LIMIT $2
@@ -251,8 +314,12 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       return res.json({
         conversation: {
           id: Number(conversation.id),
-          displayName: conversation.display_name || conversation.line_user_id,
+          channel: conversation.channel,
+          displayName: conversation.display_name || conversation.line_user_id || conversation.messenger_user_id,
           lineUserId: conversation.line_user_id,
+          channelUserId: conversation.line_user_id || conversation.messenger_user_id,
+          latestCustomerMessageAt: conversation.latest_customer_message_at,
+          sendEligible: conversation.channel !== 'FACEBOOK' || Boolean(conversation.latest_customer_message_at && Date.now() - new Date(conversation.latest_customer_message_at).getTime() >= 0 && Date.now() - new Date(conversation.latest_customer_message_at).getTime() < 24 * 60 * 60 * 1000),
           pictureUrl: safeProfilePictureUrl(conversation.picture_url),
           mode: conversation.mode,
           currentStep: conversation.current_step,
@@ -299,7 +366,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
   app.get('/admin', async (req, res, next) => {
     try {
       const conversationId = positiveId(req.query.conversation);
-      if (conversationId) return res.redirect(303, `/admin/inbox?conversation=${conversationId}`);
+      if (conversationId) return res.redirect(303, `/admin/inbox?channel=${req.query.channel === 'FACEBOOK' ? 'FACEBOOK' : 'LINE'}&conversation=${conversationId}`);
       return res.type('html').send(staffShell('ภาพรวม', 'overview', await overviewPage(db), req.staff, req.csrfToken));
     } catch (error) { return next(error); }
   });
@@ -330,13 +397,69 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       return res.type('html').send(staffShell('Rich Menu', 'rich-menu', content, req.staff, req.csrfToken));
     } catch (error) { return next(error); }
   });
+  app.get(['/admin/messenger-menu', '/admin/messenger-menu/preview'], async (req, res, next) => {
+    try {
+      const { rows } = await db.query('SELECT id, menu_json, page_menu_id, status, last_error, created_by, created_at, published_at FROM messenger_menu_publications ORDER BY id DESC LIMIT 10');
+      const content = messengerMenuPage({ rows, csrfToken: req.csrfToken, enabled: Boolean(config.messengerEnabled && messengerClient?.setPersistentMenu) });
+      return res.type('html').send(staffShell('เมนู Messenger', 'messenger-menu', content, req.staff, req.csrfToken));
+    } catch (error) { return next(error); }
+  });
+  app.post('/admin/messenger-menu/draft', requireCsrf, async (req, res, next) => {
+    try {
+      await withTransaction(db, async (client) => {
+        await client.query("DELETE FROM messenger_menu_publications WHERE status = 'DRAFT'");
+        await client.query("INSERT INTO messenger_menu_publications(menu_json, status, created_by) VALUES ($1::jsonb, 'DRAFT', $2)", [JSON.stringify(persistentMenu()), req.staff.username]);
+        await client.query('INSERT INTO audit_logs(staff_username, action, entity_type, details_json) VALUES ($1, $2, $3, $4::jsonb)', [req.staff.username, 'messenger_menu.draft_created', 'messenger_menu', JSON.stringify({ channel: 'FACEBOOK' })]);
+      });
+      return res.redirect(303, '/admin/messenger-menu/preview');
+    } catch (error) {
+      if (error.code === '23505') return res.status(409).type('text').send('มีฉบับร่าง Messenger ถูกสร้างพร้อมกัน กรุณาโหลดหน้านี้ใหม่');
+      return next(error);
+    }
+  });
+  app.post('/admin/messenger-menu/draft/:id/cancel', requireCsrf, async (req, res, next) => {
+    try {
+      const id = positiveId(req.params.id);
+      if (!id) return res.sendStatus(404);
+      const { rows } = await db.query("DELETE FROM messenger_menu_publications WHERE id = $1 AND status IN ('DRAFT', 'FAILED') RETURNING id", [id]);
+      if (rows[0]) await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'messenger_menu.draft_cancelled', 'messenger_menu', String(id), JSON.stringify({ channel: 'FACEBOOK' })]);
+      return res.redirect(303, '/admin/messenger-menu');
+    } catch (error) { return next(error); }
+  });
+  app.post('/admin/messenger-menu/publish', requireCsrf, async (req, res, next) => {
+    let id;
+    try {
+      if (!config.messengerEnabled || !messengerClient?.setPersistentMenu) return res.status(503).send('ยังไม่ได้ตั้งค่า Messenger Platform credentials');
+      if (req.body.confirm !== 'publish') return res.status(400).send('กรุณายืนยันก่อนเผยแพร่เมนู');
+      id = positiveId(req.body.publication_id);
+      if (!id) return res.status(400).send('ไม่พบฉบับร่างเมนู Messenger');
+      const { rows } = await db.query("UPDATE messenger_menu_publications SET status = 'CREATING' WHERE id = $1 AND status IN ('DRAFT', 'FAILED') RETURNING menu_json", [id]);
+      if (!rows[0]) return res.status(409).send('ฉบับร่างไม่พร้อมเผยแพร่หรือกำลังดำเนินการอยู่');
+      const menu = typeof rows[0].menu_json === 'string' ? JSON.parse(rows[0].menu_json) : rows[0].menu_json;
+      await messengerClient.setPersistentMenu(menu);
+      await withTransaction(db, async (client) => {
+        await client.query("UPDATE messenger_menu_publications SET status = 'REPLACED' WHERE status = 'PUBLISHED'");
+        await client.query("UPDATE messenger_menu_publications SET status = 'PUBLISHED', page_menu_id = NULL, last_error = NULL, published_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'CREATING'", [id]);
+        await client.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'messenger_menu.published', 'messenger_menu', String(id), JSON.stringify({ channel: 'FACEBOOK' })]);
+      });
+      return res.redirect(303, '/admin/messenger-menu?published=1');
+    } catch (error) {
+      if (id) {
+        const category = /^[a-z0-9_]{1,64}$/i.test(error.category || '') ? error.category : 'messenger_menu_publish_failed';
+        await db.query("UPDATE messenger_menu_publications SET status = 'FAILED', last_error = $2 WHERE id = $1 AND status = 'CREATING'", [id, category]).catch(() => {});
+        await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'messenger_menu.publish_failed', 'messenger_menu', String(id), JSON.stringify({ channel: 'FACEBOOK', category })]).catch(() => {});
+      }
+      return res.redirect(303, '/admin/messenger-menu?failed=1');
+    }
+  });
   app.post('/admin/notifications/:id/read', requireCsrf, async (req, res, next) => {
     const notificationId = Number(req.params.id);
     if (!Number.isSafeInteger(notificationId) || notificationId <= 0) return res.sendStatus(404);
     try {
       const { rows } = await db.query('UPDATE staff_notifications SET read_at = COALESCE(read_at, CURRENT_TIMESTAMP) WHERE id = $1 RETURNING conversation_id', [notificationId]);
       if (!rows[0]) return res.sendStatus(404);
-      return res.redirect(303, `/admin/inbox?conversation=${encodeURIComponent(rows[0].conversation_id)}`);
+      const { rows: conversationRows } = await db.query('SELECT channel FROM conversations WHERE id = $1', [rows[0].conversation_id]);
+      return res.redirect(303, `/admin/inbox?channel=${conversationRows[0]?.channel || 'LINE'}&conversation=${encodeURIComponent(rows[0].conversation_id)}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/logout', requireCsrf, async (req, res, next) => {
@@ -349,20 +472,22 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const updated = await conversations.setMode(Number(req.params.id), req.body.mode, req.staff.username);
       if (!updated) return res.sendStatus(404);
-      return res.redirect(303, `/admin/inbox?conversation=${encodeURIComponent(req.params.id)}`);
+      return res.redirect(303, `/admin/inbox?channel=${req.body.channel === 'FACEBOOK' ? 'FACEBOOK' : 'LINE'}&conversation=${encodeURIComponent(req.params.id)}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/conversations/:id/reply', requireCsrf, async (req, res, next) => {
     try {
       const text = String(req.body.text || '').trim();
       if (!text || text.length > 2000) return res.status(400).send('ข้อความต้องมี 1 ถึง 2,000 ตัวอักษร');
-      const { rows: conversations } = await db.query('SELECT c.id, c.mode, c.line_user_id FROM conversations c WHERE c.id = $1', [Number(req.params.id)]);
-      const conversation = conversations[0];
+      const { rows: conversationRows } = await db.query('SELECT c.id, c.channel, c.mode, c.line_user_id, c.messenger_user_id FROM conversations c WHERE c.id = $1', [Number(req.params.id)]);
+      const conversation = conversationRows[0];
       if (!conversation) return res.sendStatus(404);
       if (conversation.mode !== 'HUMAN') return res.status(409).send('เปลี่ยนสถานะเป็น HUMAN ก่อนตอบแชต');
-      const outgoingId = await deliverPush(conversation, { type: 'text', text });
-      await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'conversation.staff_reply', 'message', String(outgoingId), JSON.stringify({ conversationId: conversation.id })]);
-      return res.redirect(303, `/admin/inbox?conversation=${encodeURIComponent(req.params.id)}`);
+      const result = await conversations.sendMessageToConversation(conversation.id, conversation.channel === 'FACEBOOK' ? { text } : { type: 'text', text });
+      if (result.outcome === 'window_expired') return res.status(409).type('text').send('ส่งข้อความไม่ได้เพราะพ้นช่วงเวลาตอบกลับ 24 ชั่วโมงแล้ว ลูกค้าต้องส่งข้อความหาเพจก่อน');
+      if (result.outcome !== 'sent') return res.sendStatus(404);
+      await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'conversation.staff_reply', 'message', String(result.messageId), JSON.stringify({ conversationId: conversation.id, channel: conversation.channel })]);
+      return res.redirect(303, `/admin/inbox?channel=${conversation.channel}&conversation=${encodeURIComponent(req.params.id)}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/conversations/:id/profile/refresh', requireCsrf, async (req, res, next) => {
@@ -371,7 +496,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const outcome = await conversations.refreshProfileForConversation(conversationId, { force: true });
       if (outcome === 'missing') return res.sendStatus(404);
-      return res.redirect(303, `/admin/inbox?conversation=${encodeURIComponent(conversationId)}&profile=${encodeURIComponent(outcome)}`);
+      return res.redirect(303, `/admin/inbox?channel=${req.body.channel === 'FACEBOOK' ? 'FACEBOOK' : 'LINE'}&conversation=${encodeURIComponent(conversationId)}&profile=${encodeURIComponent(outcome)}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/conversations/:id/quotations', requireCsrf, async (req, res, next) => {
@@ -380,19 +505,26 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const quotationId = await quotations.createDraft(conversationId, req.staff.username);
       if (!quotationId) return res.sendStatus(404);
-      return res.redirect(303, `/admin/quotations/${quotationId}`);
+      const { rows: channelRows } = await db.query('SELECT channel FROM conversations WHERE id = $1', [conversationId]);
+      return res.redirect(303, `/admin/quotations/${quotationId}?channel=${channelRows[0]?.channel || (req.body.channel === 'FACEBOOK' ? 'FACEBOOK' : 'LINE')}`);
     } catch (error) { return next(error); }
   });
   app.get('/admin/quotations', async (req, res, next) => {
     try {
-      const { rows } = await db.query('SELECT q.*, c.line_user_id, u.display_name FROM quotations q JOIN conversations c ON c.id = q.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id ORDER BY q.updated_at DESC, q.id DESC LIMIT 300');
+      const { rows } = await db.query(`SELECT q.*, c.channel, c.line_user_id, c.messenger_user_id,
+        COALESCE(c.line_user_id, c.messenger_user_id) AS channel_user_id,
+        COALESCE(lu.display_name, mu.display_name) AS display_name
+        FROM quotations q JOIN conversations c ON c.id = q.conversation_id
+        LEFT JOIN line_users lu ON lu.line_user_id = c.line_user_id
+        LEFT JOIN messenger_users mu ON mu.messenger_user_id = c.messenger_user_id
+        ORDER BY q.updated_at DESC, q.id DESC LIMIT 300`);
       const statusFilter = ['DRAFT', 'SENT', 'ACCEPTED', 'REJECTED', 'EXPIRED', 'SUPERSEDED', 'CANCELLED'].includes(req.query.status) ? req.query.status : '';
       const content = quotationListPage({ rows: rows.map(normalizeQuotation), staff: req.staff, csrfToken: req.csrfToken, seller, statusFilter, today: bangkokToday() });
       return res.type('html').send(staffShell('ใบเสนอราคา', 'quotations', content, req.staff, req.csrfToken));
     } catch (error) { return next(error); }
   });
   const renderEditor = (res, req, loaded, { status = 200, model, errors = [], notice = '' } = {}) => {
-    const content = quotationEditorPage({ quotation: loaded.quotation, model: model || editorModel(loaded.quotation, loaded.items), errors, staff: req.staff, csrfToken: req.csrfToken, seller, vatRateBp: quotations.vatRateBp(), notice });
+    const content = quotationEditorPage({ quotation: loaded.quotation, model: model || editorModel(loaded.quotation, loaded.items), errors, staff: req.staff, csrfToken: req.csrfToken, seller, vatRateBp: quotations.vatRateBp(), notice, channel: loaded.channel || req.quotation?.channel || 'LINE' });
     return res.status(status).type('html').send(staffShell(`แก้ไข ${quotationLabel(loaded.quotation)}`, 'quotations', content, req.staff, req.csrfToken, ['/assets/quotation-editor.js']));
   };
   const loadStaffQuotation = async (req, res, next) => {
@@ -401,7 +533,8 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const loaded = await quotations.load(quotationId);
       if (!loaded) return res.sendStatus(404);
-      req.quotation = loaded;
+      const { rows: conversations } = await db.query('SELECT channel FROM conversations WHERE id = $1', [loaded.quotation.conversation_id]);
+      req.quotation = { ...loaded, channel: conversations[0]?.channel || 'LINE' };
       return next();
     } catch (error) { return next(error); }
   };
@@ -410,7 +543,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       const { quotation, items } = req.quotation;
       if (quotation.status === 'DRAFT') return renderEditor(res, req, req.quotation, { notice: req.query.saved ? '<div class="q-alert ok">บันทึกฉบับร่างแล้ว</div>' : '' });
       const { rows: history } = await db.query('SELECT id, number, revision, status, valid_until, total_satang FROM quotations WHERE number = $1 ORDER BY revision', [quotation.number]);
-      const content = quotationViewPage({ quotation, items, history: history.map(normalizeQuotation), staff: req.staff, csrfToken: req.csrfToken, link: quotation.public_token ? quotationLink(quotation.public_token) : '', today: bangkokToday(), flash: req.query.flash });
+      const content = quotationViewPage({ quotation, items, history: history.map(normalizeQuotation), staff: req.staff, csrfToken: req.csrfToken, link: quotation.public_token ? quotationLink(quotation.public_token) : '', today: bangkokToday(), flash: req.query.flash, channel: req.quotation.channel });
       return res.type('html').send(staffShell(quotationLabel(quotation), 'quotations', content, req.staff, req.csrfToken, ['/assets/quotation-editor.js']));
     } catch (error) { return next(error); }
   });
@@ -442,6 +575,12 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
         return renderEditor(res, req, req.quotation, { status: 409, model: formModel(values, req.body), errors: [setupError] });
       }
       if (!(await saveDraftFromForm(req, res))) return undefined;
+      const { rows: conversationRows } = await db.query('SELECT channel FROM conversations WHERE id = $1', [req.quotation.quotation.conversation_id]);
+      if (conversationRows[0]?.channel === 'FACEBOOK' && !(await conversations.getMessengerSendEligibility(req.quotation.quotation.conversation_id)).eligible) {
+        const reloaded = await quotations.load(id);
+        const { values } = parseQuotationForm(req.body);
+        return renderEditor(res, req, reloaded, { status: 409, model: formModel(values, req.body), errors: ['ส่งใบเสนอราคาใน Messenger ไม่ได้เพราะพ้นช่วงเวลาตอบกลับ 24 ชั่วโมงแล้ว ฉบับร่างถูกบันทึกไว้ ให้ลูกค้าส่งข้อความหาเพจก่อน'] });
+      }
       const issued = await quotations.issue(id, req.staff.username);
       if (issued.outcome === 'invalid') {
         const reloaded = await quotations.load(id);
@@ -449,8 +588,16 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
       }
       if (issued.outcome !== 'issued') return res.redirect(303, `/admin/quotations/${id}`);
       const { quotation } = await quotations.load(id);
-      const delivered = await pushQuotationCard(quotation);
-      return res.redirect(303, `/admin/quotations/${id}?flash=${delivered ? 'sent' : 'push-failed'}`);
+      const delivery = await pushQuotationCard(quotation);
+      if (delivery.windowExpired) {
+        const reverted = await quotations.returnToDraftAfterMessengerWindowExpiry(id, req.staff.username);
+        if (reverted) {
+          const reloaded = await quotations.load(id);
+          const { values } = parseQuotationForm(req.body);
+          return renderEditor(res, req, reloaded, { status: 409, model: formModel(values, req.body), errors: ['ส่งใบเสนอราคาใน Messenger ไม่ได้เพราะพ้นช่วงเวลาตอบกลับ 24 ชั่วโมงแล้ว ฉบับร่างถูกบันทึกไว้ ให้ลูกค้าส่งข้อความหาเพจก่อน'] });
+        }
+      }
+      return res.redirect(303, `/admin/quotations/${id}?flash=${delivery.delivered ? 'sent' : 'push-failed'}`);
     } catch (error) { return next(error); }
   });
   app.get('/admin/quotations/:id/pdf', loadStaffQuotation, async (req, res, next) => {
@@ -460,9 +607,9 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const { quotation } = req.quotation;
       if (effectiveStatus(quotation, bangkokToday()) !== 'SENT') return res.status(409).send('ส่งการ์ดได้เฉพาะใบเสนอราคาที่รอลูกค้าตอบรับ');
-      const delivered = await pushQuotationCard(quotation);
-      await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'quotation.card_resent', 'quotation', String(quotation.id), JSON.stringify({ delivered })]);
-      return res.redirect(303, `/admin/quotations/${quotation.id}?flash=${delivered ? 'resent' : 'push-failed'}`);
+      const delivery = await pushQuotationCard(quotation);
+      await db.query('INSERT INTO audit_logs(staff_username, action, entity_type, entity_id, details_json) VALUES ($1, $2, $3, $4, $5::jsonb)', [req.staff.username, 'quotation.card_resent', 'quotation', String(quotation.id), JSON.stringify({ delivered: delivery.delivered })]);
+      return res.redirect(303, `/admin/quotations/${quotation.id}?flash=${delivery.delivered ? 'resent' : 'push-failed'}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/quotations/:id/revise', loadStaffQuotation, requireCsrf, async (req, res, next) => {
@@ -482,7 +629,7 @@ function buildApp({ db, lineClient, config, verifyLiffToken = verifyIdToken }) {
     try {
       const conversationId = await quotations.deleteDraft(req.quotation.quotation.id, req.staff.username);
       if (!conversationId) return res.status(409).send('ลบได้เฉพาะฉบับร่าง');
-      return res.redirect(303, `/admin/inbox?conversation=${conversationId}`);
+      return res.redirect(303, `/admin/inbox?channel=${req.quotation.channel || 'LINE'}&conversation=${conversationId}`);
     } catch (error) { return next(error); }
   });
   app.post('/admin/quotations/:id/decision/read', loadStaffQuotation, requireCsrf, async (req, res, next) => {
@@ -598,7 +745,8 @@ function requireStaff(db, config) {
     req.cookies = parseCookies(req.get('cookie'));
     const token = req.cookies.donnar_session;
     const conversationId = typeof req.query.conversation === 'string' ? positiveId(req.query.conversation) : null;
-    const loginUrl = conversationId ? `/admin/login?conversation=${conversationId}` : '/admin/login';
+    const channel = req.query.channel === 'FACEBOOK' ? 'FACEBOOK' : 'LINE';
+    const loginUrl = conversationId ? `/admin/login?channel=${channel}&conversation=${conversationId}` : '/admin/login';
     if (!token) return res.redirect(303, loginUrl);
     let session;
     try {
@@ -670,7 +818,7 @@ function shell(title, content, scripts = []) {
   .staff-layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:20px;align-items:start}.staff-nav{position:sticky;top:18px;background:white;border:1px solid var(--line);border-radius:16px;padding:12px;box-shadow:0 8px 28px #14233b08}.staff-nav a{display:flex;align-items:center;min-height:42px;padding:9px 12px;border-radius:10px;color:#53647b;text-decoration:none;font-weight:650}.staff-nav a:hover{background:#f4f7fb;color:var(--ink)}.staff-nav a.active{background:#e9f1fd;color:var(--blue)}.staff-content{min-width:0}.staff-toolbar{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin:0 0 18px}.staff-toolbar form{margin:0}.staff-toolbar button{padding:8px 12px}.staff-user{color:var(--muted);font-size:13px}.overview-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:0 0 20px}.overview-card{display:flex;flex-direction:column;gap:4px;padding:17px;background:white;border:1px solid var(--line);border-radius:14px;color:inherit;text-decoration:none;box-shadow:0 8px 28px #14233b08}.overview-card:hover{border-color:#b8d0f6;transform:translateY(-1px)}.overview-card span{color:var(--muted);font-size:13px}.overview-card strong{font-size:26px;line-height:1.2}.overview-card small{font-size:12px}.overview-card.blue strong{color:var(--blue)}.overview-card.orange strong{color:#d77a12}.overview-card.green strong{color:var(--green)}.overview-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.overview-action{display:block;padding:17px;background:white;border:1px solid var(--line);border-radius:14px;color:inherit;text-decoration:none}.overview-action:hover{border-color:#b8d0f6;background:#fbfcfe}.overview-action h2{margin:0 0 5px}.overview-action p{margin:0;color:var(--muted);font-size:13px}
   @media(max-width:850px){.staff-layout{grid-template-columns:1fr}.staff-nav{position:static;display:flex;gap:4px;overflow-x:auto;white-space:nowrap}.staff-nav a{flex:0 0 auto}}
   @media(max-width:620px){.staff-nav{padding:7px}.staff-nav a{min-height:38px;padding:8px 10px;font-size:13px}.staff-toolbar{justify-content:space-between}.overview-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.overview-card{padding:13px}.overview-card strong{font-size:22px}.overview-actions{grid-template-columns:1fr}}
-  </style><header><img src="/assets/donnar-tech-logo.png" alt="Donnar.Tech"><strong>Donnar.Tech <span style="opacity:.65;font-weight:450">· LINE Back Office</span></strong></header><main>${content}</main>${scripts.map((src) => `<script src="${escapeHtml(src)}" defer></script>`).join('')}</html>`;
+  </style><header><img src="/assets/donnar-tech-logo.png" alt="Donnar.Tech"><strong>Donnar.Tech <span style="opacity:.65;font-weight:450">· CRM</span></strong></header><main>${content}</main>${scripts.map((src) => `<script src="${escapeHtml(src)}" defer></script>`).join('')}</html>`;
 }
 
 function staffShell(title, activePage, content, staff, csrfToken, scripts = []) {
@@ -680,6 +828,7 @@ function staffShell(title, activePage, content, staff, csrfToken, scripts = []) 
     { key: 'follow-ups', href: '/admin/follow-ups', label: 'งานติดตาม' },
     { key: 'quotations', href: '/admin/quotations', label: 'ใบเสนอราคา' },
     { key: 'content', href: '/admin/content', label: 'ข้อความบอต' },
+    { key: 'messenger-menu', href: '/admin/messenger-menu', label: 'เมนู Messenger' },
     { key: 'rich-menu', href: '/admin/rich-menu', label: 'Rich Menu' },
   ];
   const navigation = items.map((item) => `<a href="${item.href}" class="${item.key === activePage ? 'active' : ''}"${item.key === activePage ? ' aria-current="page"' : ''}>${item.label}</a>`).join('');
@@ -713,42 +862,47 @@ async function overviewPage(db) {
     { href: '/admin/follow-ups', label: 'รอทีมตอบ', value: stats.waiting_count, hint: 'มีข้อความรอติดตาม', tone: 'orange' },
     { href: '/admin/quotations', label: 'ใบเสนอราคาที่มีคำตอบใหม่', value: stats.quotation_decision_count, hint: 'เปิดใบเสนอราคา', tone: 'green' },
   ].map((item) => `<a class="overview-card ${item.tone}" href="${item.href}"><span>${item.label}</span><strong>${Number(item.value || 0)}</strong><small>${item.hint}</small></a>`).join('');
-  return `<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>ภาพรวม</h1><p class="muted">สรุปงานและทางลัดไปยังส่วนที่ต้องจัดการ</p></div></div><section class="overview-metrics" aria-label="สรุปงาน">${cards}</section><section class="overview-actions" aria-label="ทางลัด"><a class="overview-action" href="/admin/inbox"><h2>กล่องข้อความ</h2><p>ค้นหาและตอบลูกค้าจาก LINE</p></a><a class="overview-action" href="/admin/follow-ups"><h2>งานติดตาม</h2><p>ตรวจ Lead ใหม่และบทสนทนาที่รอทีมตอบ</p></a></section>`;
+  return `<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>ภาพรวม</h1><p class="muted">สรุปงานและทางลัดไปยังส่วนที่ต้องจัดการ</p></div></div><section class="overview-metrics" aria-label="สรุปงาน">${cards}</section><section class="overview-actions" aria-label="ทางลัด"><a class="overview-action" href="/admin/inbox"><h2>กล่องข้อความ</h2><p>ค้นหาและตอบลูกค้าจาก LINE และ Facebook</p></a><a class="overview-action" href="/admin/follow-ups"><h2>งานติดตาม</h2><p>ตรวจ Lead ใหม่และบทสนทนาที่รอทีมตอบ</p></a></section>`;
 }
 
-function loginPage(error = '', requestedConversation) {
+function loginPage(error = '', requestedConversation, requestedChannel) {
   const conversationId = typeof requestedConversation === 'string' ? positiveId(requestedConversation) : null;
-  return shell('Staff login', `<section class="card" style="max-width:420px;margin:10vh auto"><h1>เข้าสู่ระบบทีม</h1>${error ? `<p role="alert">${escapeHtml(error)}</p>` : ''}<form method="post" action="/admin/login">${conversationId ? `<input type="hidden" name="conversation" value="${conversationId}">` : ''}<label>ชื่อผู้ใช้<input name="username" autocomplete="username" required></label><label>รหัสผ่าน<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">เข้าสู่ระบบ</button></form></section>`);
+  const channel = requestedChannel === 'FACEBOOK' ? 'FACEBOOK' : 'LINE';
+  return shell('Staff login', `<section class="card" style="max-width:420px;margin:10vh auto"><h1>เข้าสู่ระบบทีม</h1>${error ? `<p role="alert">${escapeHtml(error)}</p>` : ''}<form method="post" action="/admin/login">${conversationId ? `<input type="hidden" name="conversation" value="${conversationId}"><input type="hidden" name="channel" value="${channel}">` : ''}<label>ชื่อผู้ใช้<input name="username" autocomplete="username" required></label><label>รหัสผ่าน<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">เข้าสู่ระบบ</button></form></section>`);
 }
 
 async function inboxPage(db, csrfToken, query = {}, { profileRefreshResult = null, inboxEventId = 0 } = {}) {
+  const channel = query.channel === 'FACEBOOK' ? 'FACEBOOK' : 'LINE';
+  const channelName = channel === 'FACEBOOK' ? 'Facebook' : 'LINE';
   const rawSearch = typeof query.q === 'string' ? query.q : '';
   const search = rawSearch.trim();
   const modeFilter = ['BOT', 'HUMAN'].includes(query.mode) ? query.mode : '';
   const statusFilter = ['NEW', 'QUALIFYING', 'QUALIFIED', 'HUMAN_REQUIRED'].includes(query.status) ? query.status : '';
-  const leadSelect = `SELECT l.*, c.id AS conversation_id, c.mode, c.current_step, c.line_user_id, u.display_name, u.picture_url, u.profile_synced_at, preview.body AS preview_body
+  const leadSelect = `SELECT l.*, c.id AS conversation_id, c.channel, c.mode, c.current_step, c.line_user_id, c.messenger_user_id,
+      COALESCE(lu.display_name, mu.display_name) AS display_name, COALESCE(lu.picture_url, mu.picture_url) AS picture_url,
+      COALESCE(lu.profile_synced_at, mu.profile_synced_at) AS profile_synced_at,
+      COALESCE(c.line_user_id, c.messenger_user_id) AS channel_user_id,
+      preview.body AS preview_body, inbound.latest_customer_message_at
     FROM leads l
     JOIN conversations c ON c.id = l.conversation_id
-    JOIN line_users u ON u.line_user_id = c.line_user_id
-    LEFT JOIN LATERAL (
-      SELECT m.body FROM messages m
-      WHERE m.conversation_id = c.id
-      ORDER BY m.id DESC LIMIT 1
-    ) preview ON TRUE`;
+    LEFT JOIN line_users lu ON lu.line_user_id = c.line_user_id
+    LEFT JOIN messenger_users mu ON mu.messenger_user_id = c.messenger_user_id
+    LEFT JOIN LATERAL (SELECT m.body FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1) preview ON TRUE
+    LEFT JOIN LATERAL (SELECT max(m.provider_timestamp) AS latest_customer_message_at FROM messages m WHERE m.conversation_id = c.id AND m.direction = 'IN') inbound ON TRUE`;
   const { rows: visibleLeads } = await db.query(`${leadSelect}
-    WHERE ($1 = '' OR
-      POSITION(LOWER($1) IN LOWER(COALESCE(u.display_name, ''))) > 0 OR
-      POSITION(LOWER($1) IN LOWER(COALESCE(c.line_user_id, ''))) > 0 OR
+    WHERE c.channel = $4 AND ($1 = '' OR
+      POSITION(LOWER($1) IN LOWER(COALESCE(lu.display_name, mu.display_name, ''))) > 0 OR
+      POSITION(LOWER($1) IN LOWER(COALESCE(c.line_user_id, c.messenger_user_id, ''))) > 0 OR
       POSITION(LOWER($1) IN LOWER(COALESCE(l.status, ''))) > 0 OR
       POSITION(LOWER($1) IN LOWER(COALESCE(c.current_step, ''))) > 0 OR
       POSITION(LOWER($1) IN LOWER(COALESCE(l.requirements_json::text, ''))) > 0 OR
       EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id AND POSITION(LOWER($1) IN LOWER(COALESCE(m.body, ''))) > 0)
     ) AND ($2 = '' OR c.mode = $2) AND ($3 = '' OR l.status = $3)
-    ORDER BY l.updated_at DESC, l.id DESC LIMIT 100`, [search, modeFilter, statusFilter]);
+    ORDER BY l.updated_at DESC, l.id DESC LIMIT 100`, [search, modeFilter, statusFilter, channel]);
   const requestedId = typeof query.conversation === 'string' ? positiveId(query.conversation) : null;
   let selected = requestedId ? visibleLeads.find((lead) => Number(lead.conversation_id) === requestedId) : null;
   if (requestedId && !selected) {
-    const { rows } = await db.query(`${leadSelect} WHERE c.id = $1`, [requestedId]);
+    const { rows } = await db.query(`${leadSelect} WHERE c.id = $1 AND c.channel = $2`, [requestedId, channel]);
     selected = rows[0] || null;
   }
   selected = selected || visibleLeads[0] || null;
@@ -759,22 +913,24 @@ async function inboxPage(db, csrfToken, query = {}, { profileRefreshResult = nul
     ? (await db.query('SELECT id, number, revision, status, valid_until, total_satang FROM quotations WHERE conversation_id = $1 ORDER BY created_at DESC, id DESC LIMIT 10', [selected.conversation_id])).rows.map(normalizeQuotation)
     : [];
   const selectedRequirements = selected?.requirements_json || {};
+  const latestCustomerMessageAt = selected?.latest_customer_message_at ? new Date(selected.latest_customer_message_at) : null;
+  const messengerCanSend = channel !== 'FACEBOOK' || Boolean(latestCustomerMessageAt && Date.now() - latestCustomerMessageAt.getTime() >= 0 && Date.now() - latestCustomerMessageAt.getTime() < 24 * 60 * 60 * 1000);
   const today = bangkokToday();
   const statusLabels = { NEW: 'ลูกค้าใหม่', QUALIFYING: 'กำลังเก็บข้อมูล', QUALIFIED: 'คัดกรองแล้ว', HUMAN_REQUIRED: 'รอพนักงาน' };
-  const stepLabels = { serviceType: 'ประเภทงาน', projectSummary: 'รายละเอียดโปรเจกต์', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ', complete: 'เก็บข้อมูลครบแล้ว' };
-  const requirementLabels = { serviceType: 'ประเภทงาน', projectSummary: 'รายละเอียดโปรเจกต์', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ' };
-  const listParams = new URLSearchParams({ ...(search ? { q: search } : {}), ...(modeFilter ? { mode: modeFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}) });
-  const listHref = `/admin/inbox${listParams.size ? `?${listParams.toString()}` : ''}`;
-  const selectedHref = (lead) => `/admin/inbox?${new URLSearchParams({ ...(search ? { q: search } : {}), ...(modeFilter ? { mode: modeFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), conversation: String(lead.conversation_id) }).toString()}`;
+  const stepLabels = { serviceType: 'ประเภทงาน', projectSummary: 'เป้าหมาย/ปัญหา', features: 'ฟีเจอร์หลัก', audience: 'ผู้ใช้และแพลตฟอร์ม', timeline: 'ระยะเวลา', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ', complete: 'เก็บข้อมูลครบแล้ว' };
+  const requirementLabels = { serviceType: 'ประเภทงาน', projectSummary: 'เป้าหมาย/ปัญหา', features: 'ฟีเจอร์หลัก', audience: 'ผู้ใช้และแพลตฟอร์ม', timeline: 'ระยะเวลา', budgetRange: 'งบประมาณ', contactPreference: 'ช่องทางติดต่อ' };
+  const linkParams = new URLSearchParams({ channel, ...(search ? { q: search } : {}), ...(modeFilter ? { mode: modeFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}) });
+  const listHref = `/admin/inbox?${linkParams.toString()}`;
+  const selectedHref = (lead) => `/admin/inbox?${new URLSearchParams({ ...Object.fromEntries(linkParams), conversation: String(lead.conversation_id) }).toString()}`;
   const leadRows = visibleLeads.map((lead) => {
     const requirements = lead.requirements_json || {};
     const summary = lead.preview_body ? readMessage(lead.preview_body) : Object.values(requirements)[0] || 'เริ่มต้นบทสนทนา';
     const modeLabel = lead.mode === 'HUMAN' ? 'รอทีมตอบ' : 'บอตดูแล';
-    return `<a class="lead-link${selected && String(selected.conversation_id) === String(lead.conversation_id) ? ' selected' : ''}" data-conversation-id="${lead.conversation_id}" href="${selectedHref(lead)}"><div class="lead-link-top"><div class="profile-identity">${profileAvatar(lead, 34)}<span><strong>${escapeHtml(lead.display_name || lead.line_user_id)}</strong><small>${escapeHtml(lead.line_user_id)}</small></span></div><span class="mode-tag ${lead.mode === 'HUMAN' ? 'human' : 'bot'}">${modeLabel}</span></div><div class="lead-meta"><span>${escapeHtml(statusLabels[lead.status] || lead.status)}</span><span>·</span><span>${escapeHtml(stepLabels[lead.current_step] || lead.current_step)}</span></div><div class="lead-preview">${escapeHtml(summary)}</div></a>`;
+    return `<a class="lead-link${selected && String(selected.conversation_id) === String(lead.conversation_id) ? ' selected' : ''}" data-conversation-id="${lead.conversation_id}" href="${selectedHref(lead)}"><div class="lead-link-top"><div class="profile-identity">${profileAvatar(lead, 34)}<span><strong>${escapeHtml(lead.display_name || lead.channel_user_id)}</strong><small>${escapeHtml(lead.channel_user_id)}</small></span></div><span class="mode-tag ${lead.mode === 'HUMAN' ? 'human' : 'bot'}">${modeLabel}</span></div><div class="lead-meta"><span>${escapeHtml(statusLabels[lead.status] || lead.status)}</span><span>·</span><span>${escapeHtml(stepLabels[lead.current_step] || lead.current_step)}</span></div><div class="lead-preview">${escapeHtml(summary)}</div></a>`;
   }).join('');
   const hasFilters = Boolean(search || modeFilter || statusFilter);
   const emptyLeads = hasFilters
-    ? `<div class="empty-state"><div class="empty-icon">🔎</div>ไม่พบรายการที่ตรงกับตัวกรอง<br><a href="/admin/inbox">ล้างตัวกรอง</a></div>`
+    ? `<div class="empty-state"><div class="empty-icon">🔎</div>ไม่พบรายการที่ตรงกับตัวกรอง<br><a href="/admin/inbox?channel=${channel}">ล้างตัวกรอง</a></div>`
     : '<div class="empty-state"><div class="empty-icon">📭</div>ยังไม่มีบทสนทนา</div>';
   const requirementRows = Object.entries(selectedRequirements).map(([key, value]) => `<div class="requirement"><b>${escapeHtml(requirementLabels[key] || key)}</b>${escapeHtml(value)}</div>`).join('') || '<p class="muted" style="font-size:13px">ยังไม่มีข้อมูลจากแบบสอบถาม</p>';
   const messageBubbles = selectedMessages.map((message) => {
@@ -782,23 +938,35 @@ async function inboxPage(db, csrfToken, query = {}, { profileRefreshResult = nul
     const delivery = pending ? ` · ${escapeHtml(message.send_status)}${message.last_error ? ` (${escapeHtml(message.last_error)})` : ''}` : '';
     return `<div class="message ${message.direction === 'IN' ? 'in' : 'out'}" data-message-id="${message.id}"><div class="message-meta">${message.direction === 'IN' ? 'ลูกค้า' : 'Donnar.Tech'} · ${escapeHtml(formatAdminDateTime(message.created_at))}${delivery}</div>${escapeHtml(readMessage(message.body))}</div>`;
   }).join('');
-  const profileStatusText = { updated: 'อัปเดตรูปจาก LINE แล้ว', unavailable: 'LINE ยังไม่มีรูปโปรไฟล์ให้แสดง', failed: 'โหลดโปรไฟล์ไม่สำเร็จ ลองใหม่ได้', cached: 'ใช้ข้อมูลโปรไฟล์ที่บันทึกไว้' }[profileRefreshResult];
+  const profileStatusText = { updated: `อัปเดตรูปจาก ${channelName} แล้ว`, unavailable: `${channelName} ยังไม่มีรูปโปรไฟล์ให้แสดง`, failed: 'โหลดโปรไฟล์ไม่สำเร็จ ลองใหม่ได้', cached: 'ใช้ข้อมูลโปรไฟล์ที่บันทึกไว้' }[profileRefreshResult];
   const profileStatus = selected && !safeProfilePictureUrl(selected.picture_url)
-    ? `<div class="profile-status"><span>${escapeHtml(profileStatusText || (selected.profile_synced_at ? 'LINE ยังไม่มีรูปโปรไฟล์ให้แสดง' : 'ยังไม่พบรูปโปรไฟล์ LINE'))}</span><form method="post" action="/admin/conversations/${selected.conversation_id}/profile/refresh"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ลองโหลดรูปใหม่</button></form></div>`
+    ? `<div class="profile-status"><span>${escapeHtml(profileStatusText || (selected.profile_synced_at ? `${channelName} ยังไม่มีรูปโปรไฟล์ให้แสดง` : `ยังไม่พบรูปโปรไฟล์ ${channelName}`))}</span><form method="post" action="/admin/conversations/${selected.conversation_id}/profile/refresh"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="channel" value="${channel}"><button class="secondary" type="submit">ลองโหลดรูปใหม่</button></form></div>`
     : '';
-  const detail = selected ? `<section class="inbox-detail"><div class="detail-head"><div><a class="inbox-back" href="${escapeHtml(listHref)}">← กลับรายการ</a><div class="profile-identity profile-header">${profileAvatar(selected, 48)}<span><h2>${escapeHtml(selected.display_name || selected.line_user_id)}</h2><div class="muted" style="font-size:13px">LINE UID: ${escapeHtml(selected.line_user_id)}</div><div style="margin-top:9px"><span class="tag">${escapeHtml(statusLabels[selected.status] || selected.status)}</span> <span class="mode-tag ${selected.mode === 'HUMAN' ? 'human' : 'bot'}">${selected.mode === 'HUMAN' ? 'พนักงานดูแล' : 'บอตดูแล'}</span></div>${profileStatus}</span></div></div><form method="post" action="/admin/conversations/${selected.conversation_id}/mode"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="mode" value="${selected.mode === 'BOT' ? 'HUMAN' : 'BOT'}"><button class="${selected.mode === 'BOT' ? '' : 'secondary'}" type="submit">${selected.mode === 'BOT' ? 'รับช่วงตอบลูกค้า' : 'ส่งคืนให้บอต'}</button></form></div><div class="detail-grid"><div class="message-history" id="message-history">${messageBubbles || '<div class="empty-state"><div class="empty-icon">💬</div>ยังไม่มีข้อความในบทสนทนา</div>'}</div><aside class="lead-details"><div class="detail-label">รายละเอียดโปรเจกต์</div><div id="conversation-requirements">${requirementRows}</div><div class="requirement" id="conversation-current-step"><b>ขั้นตอนปัจจุบัน</b>${escapeHtml(stepLabels[selected.current_step] || selected.current_step)}</div><div class="requirement" id="conversation-lead-status"><b>สถานะ Lead</b>${escapeHtml(statusLabels[selected.status] || selected.status)}</div>${conversationQuotationPanel({ quotations: selectedQuotations, conversationId: selected.conversation_id, csrfToken, today })}</aside></div><div class="composer">${selected.mode === 'HUMAN' ? `<form method="post" action="/admin/conversations/${selected.conversation_id}/reply"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><textarea name="text" maxlength="2000" placeholder="พิมพ์ข้อความตอบลูกค้า…" aria-label="ข้อความตอบลูกค้า" required></textarea><button type="submit">ส่งข้อความ <span aria-hidden="true">➤</span></button></form><p class="composer-help">กด “ส่งคืนให้บอต” เมื่อพร้อมให้บอตดูแลบทสนทนาต่อ</p>` : '<div class="danger-note">บอตกำลังดูแลบทสนทนานี้ หากต้องการตอบลูกค้า ให้กด “รับช่วงตอบลูกค้า” ก่อน</div>'}</div></section>` : '<section class="inbox-detail empty-state"><div class="empty-icon">🔎</div><h2>ยังไม่มีบทสนทนาที่ตรงกับตัวกรอง</h2><p>ลองเปลี่ยนคำค้นหาหรือล้างตัวกรอง</p></section>';
-  const title = `<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>กล่องข้อความ</h1><p class="muted">ค้นหาและจัดการบทสนทนาจาก LINE · แสดง 100 รายการล่าสุด</p></div></div>`;
-  return `${ADMIN_STYLE}${title}<section class="inbox${selected ? ' has-selection' : ''}" id="inbox" data-selected-conversation="${selected ? selected.conversation_id : ''}" data-inbox-event-id="${inboxEventId}"><aside class="inbox-sidebar"><div class="inbox-heading"><h2>บทสนทนา <span class="muted" style="font-size:13px;font-weight:500" id="lead-count">(${visibleLeads.length})</span></h2></div><form method="get" action="/admin/inbox" class="filters"><input name="q" type="search" value="${escapeHtml(rawSearch)}" placeholder="ค้นหา UID, ข้อความ หรือรายละเอียด" aria-label="ค้นหา lead"><label for="mode-filter">สถานะการดูแล</label><select id="mode-filter" name="mode"><option value="">ทุกสถานะ</option><option value="BOT"${modeFilter === 'BOT' ? ' selected' : ''}>บอตดูแล</option><option value="HUMAN"${modeFilter === 'HUMAN' ? ' selected' : ''}>รอทีมตอบ</option></select><label for="lead-status-filter">สถานะ lead</label><select id="lead-status-filter" name="status"><option value="">ทั้งหมด</option><option value="NEW"${statusFilter === 'NEW' ? ' selected' : ''}>ใหม่</option><option value="QUALIFYING"${statusFilter === 'QUALIFYING' ? ' selected' : ''}>กำลังเก็บข้อมูล</option><option value="QUALIFIED"${statusFilter === 'QUALIFIED' ? ' selected' : ''}>คัดกรองแล้ว</option><option value="HUMAN_REQUIRED"${statusFilter === 'HUMAN_REQUIRED' ? ' selected' : ''}>ต้องการทีมดูแล</option></select><button type="submit" class="secondary" style="width:100%">ค้นหา / กรอง</button></form><div class="lead-list">${leadRows || emptyLeads}</div></aside>${detail}</section>`;
+  const windowNotice = channel === 'FACEBOOK' && !messengerCanSend
+    ? `<div class="danger-note">ส่งข้อความ Facebook ไม่ได้เพราะพ้นช่วงเวลาตอบกลับ 24 ชั่วโมงแล้ว${latestCustomerMessageAt ? ` · ข้อความล่าสุด ${escapeHtml(formatAdminDateTime(latestCustomerMessageAt))}` : ''} ลูกค้าต้องส่งข้อความหาเพจก่อนจึงจะตอบได้</div>`
+    : '';
+  const composer = selected.mode === 'HUMAN'
+    ? (messengerCanSend ? `<form method="post" action="/admin/conversations/${selected.conversation_id}/reply"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="channel" value="${channel}"><textarea name="text" maxlength="2000" placeholder="พิมพ์ข้อความตอบลูกค้า…" aria-label="ข้อความตอบลูกค้า" required></textarea><button type="submit">ส่งข้อความ <span aria-hidden="true">➤</span></button></form><p class="composer-help">กด “ส่งคืนให้บอต” เมื่อพร้อมให้บอตดูแลบทสนทนาต่อ</p>` : windowNotice)
+    : '<div class="danger-note">บอตกำลังดูแลบทสนทนานี้ หากต้องการตอบลูกค้า ให้กด “รับช่วงตอบลูกค้า” ก่อน</div>';
+  const detail = selected ? `<section class="inbox-detail"><div class="detail-head"><div><a class="inbox-back" href="${escapeHtml(listHref)}">← กลับรายการ</a><div class="profile-identity profile-header">${profileAvatar(selected, 48)}<span><h2>${escapeHtml(selected.display_name || selected.channel_user_id)}</h2><div class="muted" style="font-size:13px">${channelName} ID: ${escapeHtml(selected.channel_user_id)}</div><div style="margin-top:9px"><span class="tag">${escapeHtml(statusLabels[selected.status] || selected.status)}</span> <span class="mode-tag ${selected.mode === 'HUMAN' ? 'human' : 'bot'}">${selected.mode === 'HUMAN' ? 'พนักงานดูแล' : 'บอตดูแล'}</span></div>${profileStatus}</span></div></div><form method="post" action="/admin/conversations/${selected.conversation_id}/mode"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><input type="hidden" name="channel" value="${channel}"><input type="hidden" name="mode" value="${selected.mode === 'BOT' ? 'HUMAN' : 'BOT'}"><button class="${selected.mode === 'BOT' ? '' : 'secondary'}" type="submit">${selected.mode === 'BOT' ? 'รับช่วงตอบลูกค้า' : 'ส่งคืนให้บอต'}</button></form></div><div class="detail-grid"><div class="message-history" id="message-history">${messageBubbles || '<div class="empty-state"><div class="empty-icon">💬</div>ยังไม่มีข้อความในบทสนทนา</div>'}</div><aside class="lead-details"><div class="detail-label">รายละเอียดโปรเจกต์</div><div id="conversation-requirements">${requirementRows}</div><div class="requirement" id="conversation-current-step"><b>ขั้นตอนปัจจุบัน</b>${escapeHtml(stepLabels[selected.current_step] || selected.current_step)}</div><div class="requirement" id="conversation-lead-status"><b>สถานะ Lead</b>${escapeHtml(statusLabels[selected.status] || selected.status)}</div>${conversationQuotationPanel({ quotations: selectedQuotations, conversationId: selected.conversation_id, channel, csrfToken, today })}</aside></div><div class="composer">${windowNotice}${composer}</div></section>` : '<section class="inbox-detail empty-state"><div class="empty-icon">🔎</div><h2>ยังไม่มีบทสนทนาที่ตรงกับตัวกรอง</h2><p>ลองเปลี่ยนคำค้นหาหรือล้างตัวกรอง</p></section>';
+  const channelLinks = ['LINE', 'FACEBOOK'].map((value) => {
+    const params = new URLSearchParams({ channel: value, ...(search ? { q: search } : {}), ...(modeFilter ? { mode: modeFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}) });
+    return `<a class="${channel === value ? 'active' : ''}" href="/admin/inbox?${params.toString()}">${value === 'LINE' ? 'LINE' : 'Facebook Messenger'}</a>`;
+  }).join('');
+  const title = `<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>กล่องข้อความ</h1><p class="muted">ค้นหาและจัดการบทสนทนาจาก ${channelName} · แสดง 100 รายการล่าสุด</p><nav class="crm-nav" aria-label="เลือกช่องทาง">${channelLinks}</nav></div></div>`;
+  return `${ADMIN_STYLE}${title}<section class="inbox${selected ? ' has-selection' : ''}" id="inbox" data-channel="${channel}" data-selected-conversation="${selected ? selected.conversation_id : ''}" data-inbox-event-id="${inboxEventId}"><aside class="inbox-sidebar"><div class="inbox-heading"><h2>บทสนทนา <span class="muted" style="font-size:13px;font-weight:500" id="lead-count">(${visibleLeads.length})</span></h2></div><form method="get" action="/admin/inbox" class="filters"><input type="hidden" name="channel" value="${channel}"><input name="q" type="search" value="${escapeHtml(rawSearch)}" placeholder="ค้นหา ID, ข้อความ หรือรายละเอียด" aria-label="ค้นหา lead"><label for="mode-filter">สถานะการดูแล</label><select id="mode-filter" name="mode"><option value="">ทุกสถานะ</option><option value="BOT"${modeFilter === 'BOT' ? ' selected' : ''}>บอตดูแล</option><option value="HUMAN"${modeFilter === 'HUMAN' ? ' selected' : ''}>รอทีมตอบ</option></select><label for="lead-status-filter">สถานะ lead</label><select id="lead-status-filter" name="status"><option value="">ทั้งหมด</option><option value="NEW"${statusFilter === 'NEW' ? ' selected' : ''}>ใหม่</option><option value="QUALIFYING"${statusFilter === 'QUALIFYING' ? ' selected' : ''}>กำลังเก็บข้อมูล</option><option value="QUALIFIED"${statusFilter === 'QUALIFIED' ? ' selected' : ''}>คัดกรองแล้ว</option><option value="HUMAN_REQUIRED"${statusFilter === 'HUMAN_REQUIRED' ? ' selected' : ''}>ต้องการทีมดูแล</option></select><button type="submit" class="secondary" style="width:100%">ค้นหา / กรอง</button></form><div class="lead-list">${leadRows || emptyLeads}</div></aside>${detail}</section>`;
 }
 async function followUpsPage(db, csrfToken) {
   const [{ rows: notifications }, { rows: unreadCountRows }, { rows: waitingLeads }] = await Promise.all([
-    db.query(`SELECT n.id, n.created_at, c.id AS conversation_id, c.line_user_id, u.display_name
-      FROM staff_notifications n JOIN conversations c ON c.id = n.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id
+    db.query(`SELECT n.id, n.created_at, c.id AS conversation_id, c.channel, COALESCE(c.line_user_id, c.messenger_user_id) AS channel_user_id, COALESCE(lu.display_name, mu.display_name) AS display_name
+      FROM staff_notifications n JOIN conversations c ON c.id = n.conversation_id
+      LEFT JOIN line_users lu ON lu.line_user_id = c.line_user_id LEFT JOIN messenger_users mu ON mu.messenger_user_id = c.messenger_user_id
       WHERE n.type = 'new_lead' AND n.read_at IS NULL ORDER BY n.created_at DESC, n.id DESC LIMIT 10`),
     db.query("SELECT COUNT(*)::integer AS count FROM staff_notifications WHERE type = 'new_lead' AND read_at IS NULL"),
-    db.query(`SELECT c.id AS conversation_id, c.line_user_id, u.display_name,
+    db.query(`SELECT c.id AS conversation_id, c.channel, COALESCE(c.line_user_id, c.messenger_user_id) AS channel_user_id, COALESCE(lu.display_name, mu.display_name) AS display_name,
         inbound.body AS waiting_body, inbound.created_at AS waiting_since
-      FROM leads l JOIN conversations c ON c.id = l.conversation_id JOIN line_users u ON u.line_user_id = c.line_user_id
+      FROM leads l JOIN conversations c ON c.id = l.conversation_id
+      LEFT JOIN line_users lu ON lu.line_user_id = c.line_user_id LEFT JOIN messenger_users mu ON mu.messenger_user_id = c.messenger_user_id
       JOIN LATERAL (
         SELECT m.id, m.body, m.created_at FROM messages m
         WHERE m.conversation_id = c.id AND m.direction = 'IN'
@@ -813,8 +981,8 @@ async function followUpsPage(db, csrfToken) {
       ORDER BY inbound.created_at ASC, inbound.id ASC`),
   ]);
   const unreadCount = Number(unreadCountRows[0]?.count || 0);
-  const notificationRows = notifications.map((notification) => `<article class="triage-item"><div class="triage-item-top"><strong>${escapeHtml(notification.display_name || notification.line_user_id)}</strong><time>${escapeHtml(formatAdminDateTime(notification.created_at))}</time></div><div class="lead-meta">มี lead ใหม่จาก LINE</div><div class="triage-actions"><a class="button secondary" href="/admin/inbox?conversation=${encodeURIComponent(notification.conversation_id)}">เปิดบทสนทนา</a><form method="post" action="/admin/notifications/${encodeURIComponent(notification.id)}/read"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ทำเครื่องหมายว่าอ่านแล้ว</button></form></div></article>`).join('') || '<div class="empty-state triage-empty">ยังไม่มี Lead ใหม่ที่ยังไม่ได้อ่าน</div>';
-  const waitingRows = waitingLeads.map((lead) => `<a class="triage-item waiting-item" href="/admin/inbox?conversation=${encodeURIComponent(lead.conversation_id)}"><div class="triage-item-top"><strong>${escapeHtml(lead.display_name || lead.line_user_id)}</strong><span class="wait-time">รอ ${escapeHtml(formatElapsed(lead.waiting_since))}</span></div><div class="lead-meta">ข้อความล่าสุดจากลูกค้า · ${escapeHtml(formatAdminDateTime(lead.waiting_since))}</div><div class="lead-preview">${escapeHtml(readMessage(lead.waiting_body))}</div></a>`).join('') || '<div class="empty-state triage-empty">ไม่มีบทสนทนาที่รอคำตอบ</div>';
+  const notificationRows = notifications.map((notification) => `<article class="triage-item"><div class="triage-item-top"><strong>${escapeHtml(notification.display_name || notification.channel_user_id)}</strong><time>${escapeHtml(formatAdminDateTime(notification.created_at))}</time></div><div class="lead-meta">มี lead ใหม่จาก ${notification.channel === 'FACEBOOK' ? 'Facebook' : 'LINE'}</div><div class="triage-actions"><a class="button secondary" href="/admin/inbox?channel=${notification.channel}&conversation=${encodeURIComponent(notification.conversation_id)}">เปิดบทสนทนา</a><form method="post" action="/admin/notifications/${encodeURIComponent(notification.id)}/read"><input type="hidden" name="_csrf" value="${escapeHtml(csrfToken)}"><button class="secondary" type="submit">ทำเครื่องหมายว่าอ่านแล้ว</button></form></div></article>`).join('') || '<div class="empty-state triage-empty">ยังไม่มี Lead ใหม่ที่ยังไม่ได้อ่าน</div>';
+  const waitingRows = waitingLeads.map((lead) => `<a class="triage-item waiting-item" href="/admin/inbox?channel=${lead.channel}&conversation=${encodeURIComponent(lead.conversation_id)}"><div class="triage-item-top"><strong>${escapeHtml(lead.display_name || lead.channel_user_id)}</strong><span class="wait-time">รอ ${escapeHtml(formatElapsed(lead.waiting_since))}</span></div><div class="lead-meta">ข้อความล่าสุดจากลูกค้า · ${escapeHtml(formatAdminDateTime(lead.waiting_since))}</div><div class="lead-preview">${escapeHtml(readMessage(lead.waiting_body))}</div></a>`).join('') || '<div class="empty-state triage-empty">ไม่มีบทสนทนาที่รอคำตอบ</div>';
   return `${ADMIN_STYLE}<div class="crm-top"><div><div class="eyebrow">DONNAR TECH · CRM</div><h1>งานติดตาม</h1><p class="muted">Lead ใหม่ ${unreadCount} รายการ · บทสนทนาที่รอทีมตอบ ${waitingLeads.length} รายการ</p></div></div><section class="triage-grid" aria-label="งานที่ต้องติดตาม"><article class="card triage-panel"><div class="section-heading"><div><div class="eyebrow">NOTIFICATIONS</div><h2>Lead ใหม่ <span class="count-pill">${unreadCount}</span></h2><p>รายการใหม่ที่ยังไม่ได้อ่าน</p></div></div><div class="triage-list">${notificationRows}</div></article><article class="card triage-panel"><div class="section-heading"><div><div class="eyebrow">FOLLOW UP</div><h2>รอตอบ <span class="count-pill">${waitingLeads.length}</span></h2><p>เรียงจากลูกค้าที่รอนานที่สุด</p></div></div><div class="triage-list">${waitingRows}</div></article></section>`;
 }
 
@@ -837,14 +1005,15 @@ async function richMenuPage(db, csrfToken) {
 }
 
 function readMessage(body) {
-  try { const parsed = JSON.parse(body); return parsed.text || parsed.altText || (parsed.type === 'flex' ? 'การ์ดต้อนรับ' : body); } catch { return body; }
+  try { const parsed = JSON.parse(body); return parsed.text || parsed.altText || parsed.attachment?.payload?.text || (parsed.type === 'flex' ? 'การ์ดต้อนรับ' : body); } catch { return body; }
 }
 
 function profileAvatar(person, size) {
   const profileUrl = safeProfilePictureUrl(person.picture_url);
+  const label = person.channel === 'FACEBOOK' ? 'FB' : 'LINE';
   return profileUrl
     ? `<img class="profile-avatar" width="${size}" height="${size}" src="${escapeHtml(profileUrl)}" alt="">`
-    : `<span class="profile-avatar-fallback" role="img" aria-label="ไม่มีรูปโปรไฟล์ LINE">LINE</span>`;
+    : `<span class="profile-avatar-fallback" role="img" aria-label="ไม่มีรูปโปรไฟล์ ${label}">${label}</span>`;
 }
 
 function safeProfilePictureUrl(value) {

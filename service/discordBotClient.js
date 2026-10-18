@@ -45,21 +45,23 @@ function escapeDiscordText(value, limit) {
   return Array.from(String(value || '')).slice(0, limit).join('').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '').replace(/[\\`*_{}\[\]()<>#+\-.!|~]/g, '\\$&');
 }
 
-function buildChatDiscordNotification({ baseUrl, conversationId, displayName, lineUserId, messageType, body, createdAt }) {
+function buildChatDiscordNotification({ baseUrl, conversationId, channel = 'LINE', displayName, channelUserId, lineUserId, messageType, body, createdAt }) {
   const id = Number(conversationId);
   if (!Number.isSafeInteger(id) || id <= 0 || !/^\d+$/.test(String(conversationId))) throw discordError('discord_invalid_content', false);
   let url;
   try { url = new URL(baseUrl); }
   catch { throw discordError('discord_invalid_content', false); }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw discordError('discord_invalid_content', false);
-  url.pathname = '/admin';
-  url.search = `?conversation=${id}`;
+  url.pathname = '/admin/inbox';
+  const userId = channelUserId || lineUserId || '';
+  url.search = `?channel=${encodeURIComponent(channel)}&conversation=${id}`;
   url.hash = 'inbox';
   const labels = { image: '[Image message]', video: '[Video message]', audio: '[Audio message]', file: '[File message]', sticker: '[Sticker message]', location: '[Location message]' };
   const preview = messageType === 'text' ? body : (Object.hasOwn(labels, messageType) ? labels[messageType] : '[Non-text message]');
   const date = new Date(createdAt);
   const receivedAt = Number.isNaN(date.getTime()) ? 'Unknown' : date.toISOString();
-  const content = `New LINE message\nFrom: ${escapeDiscordText(displayName || lineUserId || 'LINE customer', 120)}\nLINE user ID: ${escapeDiscordText(lineUserId, 128)}\nReceived: ${receivedAt}\n\n${escapeDiscordText(preview, 300)}\n\nOpen CRM conversation: <${url.toString()}>`;
+  const platform = channel === 'FACEBOOK' ? 'Facebook Messenger' : 'LINE';
+  const content = `New ${platform} message\nFrom: ${escapeDiscordText(displayName || userId || `${platform} customer`, 120)}\n${platform} user ID: ${escapeDiscordText(userId, 128)}\nReceived: ${receivedAt}\n\n${escapeDiscordText(preview, 300)}\n\nOpen CRM conversation: <${url.toString()}>`;
   if (content.length > 2000) throw discordError('discord_invalid_content', false);
   return { content, allowed_mentions: { parse: [] } };
 }

@@ -53,8 +53,8 @@ function quotationListPage({ rows, staff, csrfToken, seller, statusFilter, today
   ].map((item) => `<div class="metric ${item.tone}"><span>${item.label}</span><strong>${escapeHtml(item.value)}</strong></div>`).join('');
   const filters = [['', 'ทั้งหมด'], ['DRAFT', 'ฉบับร่าง'], ['SENT', 'รอตอบรับ'], ['ACCEPTED', 'ยอมรับแล้ว'], ['REJECTED', 'ปฏิเสธ'], ['EXPIRED', 'หมดอายุ'], ['CANCELLED', 'ยกเลิก'], ['SUPERSEDED', 'ถูกแทนที่']]
     .map(([value, label]) => `<a class="${statusFilter === value ? 'active' : ''}" href="/admin/quotations${value ? `?status=${value}` : ''}">${label} (${value ? decorated.filter((row) => row.effective === value).length : decorated.length})</a>`).join('');
-  const tableRows = visible.map((row) => `<tr><td><a href="/admin/quotations/${row.id}">${escapeHtml(quotationLabel(row))}</a><br><small>${escapeHtml(row.issue_date ? formatThaiDate(row.issue_date) : 'ยังไม่ส่ง')}</small></td><td>${escapeHtml(row.buyer_json?.companyName || '-')}<br><small>LINE: ${escapeHtml(row.display_name || row.line_user_id)}</small></td><td>${escapeHtml(row.title || '-')}</td><td class="num">${formatMoney(row.total_satang)}</td><td>${statusBadge(row, today)}</td><td><small>${escapeHtml(formatThaiDateTime(row.updated_at))}</small></td></tr>`).join('');
-  return `${pageTop('ใบเสนอราคา', 'สร้างจากบทสนทนาใน CRM ส่งให้ลูกค้าทาง LINE และติดตามการตอบรับ')}${sellerWarning(seller)}<div class="metric-grid">${metrics}</div><div class="q-filters">${filters}</div>${visible.length ? `<div class="q-table-wrap"><table class="q-table"><thead><tr><th>เลขที่</th><th>ลูกค้า</th><th>โครงการ</th><th class="num">ยอดรวม (บาท)</th><th>สถานะ</th><th>อัปเดตล่าสุด</th></tr></thead><tbody>${tableRows}</tbody></table></div>` : '<div class="card empty-state"><div class="empty-icon">🧾</div><h2>ยังไม่มีใบเสนอราคา</h2><p>เปิดบทสนทนาในกล่องข้อความ แล้วกด “สร้างใบเสนอราคา” จากแผงรายละเอียดลูกค้า</p><a class="button" href="/admin/inbox">ไปที่กล่องข้อความ</a></div>'}`;
+  const tableRows = visible.map((row) => `<tr><td><a href="/admin/quotations/${row.id}">${escapeHtml(quotationLabel(row))}</a><br><small>${escapeHtml(row.issue_date ? formatThaiDate(row.issue_date) : 'ยังไม่ส่ง')}</small></td><td>${escapeHtml(row.buyer_json?.companyName || '-')}<br><small>${row.channel === 'FACEBOOK' ? 'Facebook Messenger' : 'LINE'}: ${escapeHtml(row.display_name || row.channel_user_id || row.line_user_id || row.messenger_user_id)}</small></td><td>${escapeHtml(row.title || '-')}</td><td class="num">${formatMoney(row.total_satang)}</td><td>${statusBadge(row, today)}</td><td><small>${escapeHtml(formatThaiDateTime(row.updated_at))}</small></td></tr>`).join('');
+  return `${pageTop('ใบเสนอราคา', 'สร้างจากบทสนทนาใน CRM ส่งให้ลูกค้าทางช่องทางที่ติดต่อมา และติดตามการตอบรับ')}${sellerWarning(seller)}<div class="metric-grid">${metrics}</div><div class="q-filters">${filters}</div>${visible.length ? `<div class="q-table-wrap"><table class="q-table"><thead><tr><th>เลขที่</th><th>ลูกค้า</th><th>โครงการ</th><th class="num">ยอดรวม (บาท)</th><th>สถานะ</th><th>อัปเดตล่าสุด</th></tr></thead><tbody>${tableRows}</tbody></table></div>` : '<div class="card empty-state"><div class="empty-icon">🧾</div><h2>ยังไม่มีใบเสนอราคา</h2><p>เปิดบทสนทนาในกล่องข้อความ แล้วกด “สร้างใบเสนอราคา” จากแผงรายละเอียดลูกค้า</p><a class="button" href="/admin/inbox">ไปที่กล่องข้อความ</a></div>'}`;
 }
 
 function editorModel(quotation, items) {
@@ -90,7 +90,7 @@ function itemRow(item, index) {
   return `<tr class="item-row"><td class="col-no">${index + 1}</td><td class="col-desc"><textarea name="item_description" maxlength="2000" rows="2" placeholder="รายละเอียดงาน เช่น ออกแบบและพัฒนาเว็บไซต์บริษัท 8 หน้า" aria-label="รายละเอียดรายการ">${escapeHtml(item.description || '')}</textarea></td><td class="col-qty"><input name="item_quantity" inputmode="decimal" value="${escapeHtml(item.quantityText || '')}" placeholder="1" aria-label="จำนวน"></td><td class="col-unit"><input name="item_unit" list="quotation-units" maxlength="30" value="${escapeHtml(item.unit || '')}" placeholder="งาน" aria-label="หน่วย"></td><td class="col-price"><input name="item_unit_price" inputmode="decimal" value="${escapeHtml(item.priceText || '')}" placeholder="0.00" aria-label="ราคาต่อหน่วย"></td><td class="col-amount num" data-amount>${amount}</td><td class="col-remove"><button type="button" class="remove-item" aria-label="ลบรายการ">✕</button></td></tr>`;
 }
 
-function quotationEditorPage({ quotation, model, errors = [], staff, csrfToken, seller, vatRateBp, notice = '' }) {
+function quotationEditorPage({ quotation, model, errors = [], staff, csrfToken, seller, vatRateBp, notice = '', channel = 'LINE' }) {
   const buyer = model.buyer || {};
   const rows = [...model.items, ...Array.from({ length: model.items.length ? 1 : 3 }, () => ({}))];
   const errorBox = errors.length ? `<div class="q-alert error" role="alert"><b>ยังบันทึกไม่ได้ กรุณาแก้ไขข้อมูลต่อไปนี้</b><ul>${errors.map((error) => `<li>${escapeHtml(error)}</li>`).join('')}</ul></div>` : '';
@@ -114,7 +114,7 @@ function quotationEditorPage({ quotation, model, errors = [], staff, csrfToken, 
 <div class="q-totals"><div><label>ส่วนลด (บาท)<input name="discount" inputmode="decimal" value="${escapeHtml(model.discountText || '')}" placeholder="0.00"></label><label class="q-check"><input type="checkbox" name="withholding"${model.withholding ? ' checked' : ''}> ลูกค้าเป็นนิติบุคคล หัก ณ ที่จ่าย 3% (ค่าบริการ)</label><p class="muted" style="font-size:12px">${vatRateBp ? 'คิดภาษีมูลค่าเพิ่ม 7% จากยอดหลังหักส่วนลด' : 'ผู้ขายไม่ได้จดทะเบียนภาษีมูลค่าเพิ่ม (SELLER_VAT_REGISTERED) จึงไม่คิด VAT'} · ระบบคำนวณยอดจริงอีกครั้งเมื่อบันทึก</p></div>
 <div class="q-summary" aria-live="polite"><div><span>รวมเป็นเงิน</span><span class="num" data-total="subtotal">–</span></div><div><span>ส่วนลด</span><span class="num" data-total="discount">–</span></div>${vatRow}<div class="grand"><span>รวมทั้งสิ้น</span><span class="num" data-total="total">–</span></div><div data-withholding-row><span>หัก ณ ที่จ่าย 3%</span><span class="num" data-total="withholding">–</span></div><div class="net" data-withholding-row><span>ยอดชำระสุทธิ</span><span class="num" data-total="net">–</span></div></div></div></section>
 <section class="card"><h2>เงื่อนไข</h2><div class="q-grid"><label class="full">เงื่อนไขการชำระเงิน<textarea name="payment_terms" maxlength="2000" rows="3">${escapeHtml(model.paymentTerms || '')}</textarea></label><label class="full">หมายเหตุ (แสดงในเอกสาร)<textarea name="notes" maxlength="2000" rows="3" placeholder="เช่น ราคานี้ไม่รวมค่าโฮสติ้งรายปี">${escapeHtml(model.notes || '')}</textarea></label></div></section>
-<div class="q-actionbar"><a class="button secondary" href="/admin/inbox?conversation=${quotation.conversation_id}">กลับไปบทสนทนา</a><button type="submit" class="secondary">บันทึกฉบับร่าง</button><button type="submit" class="secondary" formaction="${action}/preview" formtarget="_blank">บันทึกและดูตัวอย่าง PDF</button><button type="submit" formaction="${action}/send" data-confirm="ส่งใบเสนอราคานี้ให้ลูกค้าทาง LINE? หลังส่งแล้วจะแก้ไขเอกสารนี้ไม่ได้">บันทึกและส่งให้ลูกค้า</button></div>
+<div class="q-actionbar"><a class="button secondary" href="/admin/inbox?channel=${channel}&conversation=${quotation.conversation_id}">กลับไปบทสนทนา</a><button type="submit" class="secondary">บันทึกฉบับร่าง</button><button type="submit" class="secondary" formaction="${action}/preview" formtarget="_blank">บันทึกและดูตัวอย่าง PDF</button><button type="submit" formaction="${action}/send" data-confirm="ส่งใบเสนอราคานี้ให้ลูกค้าทาง ${channel === 'FACEBOOK' ? 'Facebook Messenger' : 'LINE'}? หลังส่งแล้วจะแก้ไขเอกสารนี้ไม่ได้">บันทึกและส่งให้ลูกค้า</button></div>
 </form>
 <div class="actions" style="justify-content:flex-end">${postButton(`${action}/delete`, csrfToken, 'ลบฉบับร่างนี้', { className: 'secondary', confirm: 'ลบฉบับร่างนี้ถาวร?' })}</div>`;
 }
@@ -130,19 +130,20 @@ function summaryRows(quotation) {
   return rows;
 }
 
-function quotationViewPage({ quotation, items, history, staff, csrfToken, link, today, flash }) {
+function quotationViewPage({ quotation, items, history, staff, csrfToken, link, today, flash, channel = 'LINE' }) {
   const status = effectiveStatus(quotation, today);
   const action = `/admin/quotations/${quotation.id}`;
   const buyer = quotation.buyer_json || {};
-  const flashes = { sent: ['ok', 'ส่งใบเสนอราคาให้ลูกค้าทาง LINE แล้ว'], resent: ['ok', 'ส่งการ์ดใบเสนอราคาใน LINE อีกครั้งแล้ว'], 'push-failed': ['warn', 'บันทึกใบเสนอราคาแล้ว แต่ส่งการ์ดใน LINE ไม่สำเร็จ คัดลอกลิงก์ไปส่งเองหรือกดส่งอีกครั้งได้'], cancelled: ['ok', 'ยกเลิกใบเสนอราคาแล้ว ลิงก์ของลูกค้าจะแสดงว่ายกเลิก'] };
+  const platform = channel === 'FACEBOOK' ? 'Facebook Messenger' : 'LINE';
+  const flashes = { sent: ['ok', `ส่งใบเสนอราคาให้ลูกค้าทาง ${platform} แล้ว`], resent: ['ok', `ส่งการ์ดใบเสนอราคาใน ${platform} อีกครั้งแล้ว`], 'push-failed': ['warn', `บันทึกใบเสนอราคาแล้ว แต่ส่งการ์ดใน ${platform} ไม่สำเร็จ คัดลอกลิงก์ไปส่งเองหรือกดส่งอีกครั้งได้`], cancelled: ['ok', 'ยกเลิกใบเสนอราคาแล้ว ลิงก์ของลูกค้าจะแสดงว่ายกเลิก'] };
   const flashBox = flashes[flash] ? `<div class="q-alert ${flashes[flash][0]}">${escapeHtml(flashes[flash][1])}</div>` : '';
   const decision = quotation.decided_at ? `<div class="q-alert ${quotation.status === 'ACCEPTED' ? 'ok' : 'error'}"><b>${quotation.status === 'ACCEPTED' ? 'ลูกค้ายอมรับใบเสนอราคา' : 'ลูกค้าปฏิเสธใบเสนอราคา'}</b> · ${escapeHtml(formatThaiDateTime(quotation.decided_at))}${quotation.decision_name ? `<br>ยืนยันโดย: ${escapeHtml(quotation.decision_name)}` : ''}${quotation.decision_reason ? `<br>เหตุผล: ${escapeHtml(quotation.decision_reason)}` : ''}${!quotation.decision_read_at ? `<div style="margin-top:8px">${postButton(`${action}/decision/read`, csrfToken, 'รับทราบแล้ว', { className: 'secondary' })}</div>` : ''}</div>` : '';
   const actions = [
     `<a class="button" href="${action}/pdf" target="_blank" rel="noopener">ดาวน์โหลด PDF</a>`,
-    status === 'SENT' ? postButton(`${action}/resend`, csrfToken, 'ส่งการ์ดใน LINE อีกครั้ง', { className: 'secondary' }) : '',
+    status === 'SENT' ? postButton(`${action}/resend`, csrfToken, `ส่งการ์ดใน ${platform} อีกครั้ง`, { className: 'secondary' }) : '',
     ['SENT', 'EXPIRED', 'REJECTED'].includes(status) ? postButton(`${action}/revise`, csrfToken, 'แก้ไขเป็นฉบับใหม่', { className: 'secondary' }) : '',
     ['SENT', 'EXPIRED'].includes(status) ? postButton(`${action}/cancel`, csrfToken, 'ยกเลิกใบเสนอราคา', { className: 'secondary', confirm: 'ยกเลิกใบเสนอราคานี้? ลูกค้าจะไม่สามารถยืนยันได้อีก' }) : '',
-    `<a class="button secondary" href="/admin/inbox?conversation=${quotation.conversation_id}">เปิดบทสนทนา</a>`,
+    `<a class="button secondary" href="/admin/inbox?channel=${channel}&conversation=${quotation.conversation_id}">เปิดบทสนทนา</a>`,
   ].join('');
   const historyRows = history.length > 1 ? `<section class="card q-history"><h2>ประวัติฉบับ</h2>${history.map((row) => `<div class="requirement"><a href="/admin/quotations/${row.id}">${escapeHtml(quotationLabel(row))}</a> · ${statusBadge(row, today)} · ${formatMoney(row.total_satang)} บาท</div>`).join('')}</section>` : '';
   const totals = [...summaryRows(quotation).map(([label, value]) => `<div><span>${escapeHtml(label)}</span><span class="num">${formatMoney(value)}</span></div>`), `<div class="grand"><span>รวมทั้งสิ้น</span><span class="num">${formatMoney(quotation.total_satang)}</span></div>`, quotation.withholding_rate_bp ? `<div><span>หัก ณ ที่จ่าย ${quotation.withholding_rate_bp / 100}%</span><span class="num">${formatMoney(-quotation.withholding_satang)}</span></div><div class="net"><span>ยอดชำระสุทธิ</span><span class="num">${formatMoney(quotation.total_satang - quotation.withholding_satang)}</span></div>` : ''].join('');
@@ -154,9 +155,9 @@ ${link ? `<label style="margin-top:16px">ลิงก์สำหรับลู
 <section class="card"><h2>ลูกค้า</h2><div class="requirement"><b>บริษัท</b>${escapeHtml(buyer.companyName || '-')}</div><div class="requirement"><b>เลขประจำตัวผู้เสียภาษี</b>${escapeHtml(buyer.taxId ? `${formatTaxId(buyer.taxId)} (${branchLabel(buyer)})` : '-')}</div><div class="requirement"><b>ที่อยู่</b>${escapeHtml(buyer.address || '-')}</div><div class="requirement"><b>ผู้ติดต่อ</b>${escapeHtml([buyer.contactName, buyer.phone, buyer.email].filter(Boolean).join(' · ') || '-')}</div></section>${historyRows}`;
 }
 
-function conversationQuotationPanel({ quotations, conversationId, csrfToken, today }) {
+function conversationQuotationPanel({ quotations, conversationId, channel = 'LINE', csrfToken, today }) {
   const list = quotations.map((row) => `<a class="q-side-item" href="/admin/quotations/${row.id}"><span><strong>${escapeHtml(quotationLabel(row))}</strong><br>${formatMoney(row.total_satang)} บาท</span>${statusBadge(row, today)}</a>`).join('');
-  return `<div class="detail-label" style="margin-top:18px">ใบเสนอราคา</div>${list ? `<div class="q-side-list">${list}</div>` : '<p class="muted" style="font-size:13px">ยังไม่มีใบเสนอราคา</p>'}<form method="post" action="/admin/conversations/${conversationId}/quotations">${csrfField(csrfToken)}<button type="submit" style="width:100%">สร้างใบเสนอราคา</button></form>`;
+  return `<div class="detail-label" style="margin-top:18px">ใบเสนอราคา</div>${list ? `<div class="q-side-list">${list}</div>` : '<p class="muted" style="font-size:13px">ยังไม่มีใบเสนอราคา</p>'}<form method="post" action="/admin/conversations/${conversationId}/quotations">${csrfField(csrfToken)}<input type="hidden" name="channel" value="${escapeHtml(channel)}"><button type="submit" style="width:100%">สร้างใบเสนอราคา</button></form>`;
 }
 
 function decisionPanel({ decisions, today }) {
@@ -177,22 +178,25 @@ label{display:block;font-size:14px;font-weight:600;margin:10px 0 4px}input[type=
 .banner{border-radius:16px;padding:16px 18px;margin:0 0 14px;font-size:15px}.banner.ok{background:#e4f6ef;color:#075e49;border:1px solid #bfe8d9}.banner.bad{background:#fdecec;color:#8f1d14;border:1px solid #f6c9c5}.banner.info{background:#eef2f7;color:#40516b;border:1px solid var(--line)}.banner b{display:block;font-size:17px;margin-bottom:2px}
 footer{text-align:center;font-size:12px;color:var(--muted);padding:8px 16px 30px}@media(max-width:480px){.meta{grid-template-columns:1fr}h1{font-size:21px}.total strong{font-size:24px}}`;
 
-function publicShell(title, content) {
-  return `<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${escapeHtml(title)}</title><style>${PUBLIC_STYLE}</style></head><body><header><div><img src="/assets/donnar-tech-logo-240.png" alt=""><strong>Donnar.Tech</strong></div></header><main>${content}</main><footer>เอกสารนี้ส่งถึงคุณผ่าน LINE Official Account ของ Donnar.Tech · มีคำถามตอบกลับในแชต LINE ได้เลย</footer></body></html>`;
+function publicShell(title, content, channel = 'LINE') {
+  const platform = channel === 'FACEBOOK' ? 'Facebook Page' : 'LINE Official Account';
+  const chat = channel === 'FACEBOOK' ? 'แชต Facebook' : 'แชต LINE';
+  return `<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>${escapeHtml(title)}</title><style>${PUBLIC_STYLE}</style></head><body><header><div><img src="/assets/donnar-tech-logo-240.png" alt=""><strong>Donnar.Tech</strong></div></header><main>${content}</main><footer>เอกสารนี้ส่งถึงคุณผ่าน ${platform} ของ Donnar.Tech · มีคำถามตอบกลับใน${chat}ได้เลย</footer></body></html>`;
 }
 
-function publicQuotationPage({ quotation, items, token, today, notice = '', error = '' }) {
+function publicQuotationPage({ quotation, items, token, today, channel = 'LINE', notice = '', error = '' }) {
   const status = effectiveStatus(quotation, today);
   const seller = quotation.seller_json || {};
   const buyer = quotation.buyer_json || {};
+  const chat = channel === 'FACEBOOK' ? 'แชต Facebook' : 'แชต LINE';
   const base = `/q/${encodeURIComponent(token)}`;
   const tone = { ACCEPTED: 'accepted', REJECTED: 'rejected', SENT: '' }[status] ?? 'muted';
   const banners = {
-    ACCEPTED: ['ok', 'ยืนยันใบเสนอราคาแล้ว', `ขอบคุณที่ไว้วางใจ Donnar.Tech${quotation.decision_name ? ` · ยืนยันโดย ${quotation.decision_name}` : ''} ทีมงานจะติดต่อกลับในแชต LINE เพื่อเริ่มขั้นตอนถัดไป`],
-    REJECTED: ['bad', 'ปฏิเสธใบเสนอราคาแล้ว', 'ขอบคุณสำหรับการแจ้งกลับ หากต้องการปรับขอบเขตงานหรืองบประมาณ บอกทีมในแชต LINE ได้เลย'],
-    EXPIRED: ['info', 'ใบเสนอราคานี้หมดอายุแล้ว', 'ติดต่อทีมในแชต LINE เพื่อขอใบเสนอราคาฉบับใหม่'],
-    SUPERSEDED: ['info', 'ใบเสนอราคานี้ถูกแทนที่ด้วยฉบับใหม่แล้ว', 'กรุณาเปิดลิงก์ฉบับล่าสุดที่ทีมส่งให้ในแชต LINE'],
-    CANCELLED: ['info', 'ใบเสนอราคานี้ถูกยกเลิกแล้ว', 'หากมีคำถาม ติดต่อทีมในแชต LINE ได้เลย'],
+    ACCEPTED: ['ok', 'ยืนยันใบเสนอราคาแล้ว', `ขอบคุณที่ไว้วางใจ Donnar.Tech${quotation.decision_name ? ` · ยืนยันโดย ${quotation.decision_name}` : ''} ทีมงานจะติดต่อกลับใน${chat}เพื่อเริ่มขั้นตอนถัดไป`],
+    REJECTED: ['bad', 'ปฏิเสธใบเสนอราคาแล้ว', `ขอบคุณสำหรับการแจ้งกลับ หากต้องการปรับขอบเขตงานหรืองบประมาณ บอกทีมใน${chat}ได้เลย`],
+    EXPIRED: ['info', 'ใบเสนอราคานี้หมดอายุแล้ว', `ติดต่อทีมใน${chat}เพื่อขอใบเสนอราคาฉบับใหม่`],
+    SUPERSEDED: ['info', 'ใบเสนอราคานี้ถูกแทนที่ด้วยฉบับใหม่แล้ว', `กรุณาเปิดลิงก์ฉบับล่าสุดที่ทีมส่งให้ใน${chat}`],
+    CANCELLED: ['info', 'ใบเสนอราคานี้ถูกยกเลิกแล้ว', `หากมีคำถาม ติดต่อทีมใน${chat}ได้เลย`],
   }[status];
   const banner = banners ? `<div class="banner ${banners[0]}"><b>${escapeHtml(banners[1])}</b>${escapeHtml(banners[2])}${status === 'ACCEPTED' || status === 'REJECTED' ? `<div class="muted" style="margin-top:4px">${escapeHtml(formatThaiDateTime(quotation.decided_at))}</div>` : ''}</div>` : '';
   const summary = [...summaryRows(quotation).map(([label, value]) => `<div><span>${escapeHtml(label)}</span><span class="num">${formatMoney(value)}</span></div>`), `<div class="strong"><span>รวมทั้งสิ้น</span><span class="num">${formatMoney(quotation.total_satang)}</span></div>`, quotation.withholding_rate_bp ? `<div><span>หัก ณ ที่จ่าย ${quotation.withholding_rate_bp / 100}% (จากยอดก่อน VAT)</span><span class="num">${formatMoney(-quotation.withholding_satang)}</span></div><div class="strong"><span>ยอดชำระสุทธิ</span><span class="num">${formatMoney(quotation.total_satang - quotation.withholding_satang)}</span></div>` : ''].join('');
@@ -204,11 +208,11 @@ function publicQuotationPage({ quotation, items, token, today, notice = '', erro
 <p style="margin:14px 0 0"><a class="button secondary" href="${base}/pdf">ดาวน์โหลดใบเสนอราคา (PDF)</a></p></section>
 ${decisionForms}
 <section class="card"><h2>รายการ</h2>${items.map((item, index) => `<div class="item"><p><b>${index + 1}.</b> ${escapeHtml(item.description)}</p><div class="calc"><span>${formatQuantity(item.quantity_hundredths)} ${escapeHtml(item.unit || '')} × ${formatMoney(item.unit_price_satang)}</span><b>${formatMoney(item.amount_satang)}</b></div></div>`).join('')}<div class="rows" style="margin-top:10px">${summary}</div></section>
-${quotation.payment_terms || quotation.notes || seller.bankAccount ? `<section class="card">${quotation.payment_terms ? `<h2>เงื่อนไขการชำระเงิน</h2><p style="white-space:pre-wrap;margin-top:0">${escapeHtml(quotation.payment_terms)}</p>` : ''}${seller.bankAccount ? `<h2>ช่องทางการชำระเงิน</h2><p style="white-space:pre-wrap;margin-top:0">${escapeHtml(seller.bankAccount)}</p>` : ''}${quotation.notes ? `<h2>หมายเหตุ</h2><p style="white-space:pre-wrap;margin:0">${escapeHtml(quotation.notes)}</p>` : ''}</section>` : ''}`);
+${quotation.payment_terms || quotation.notes || seller.bankAccount ? `<section class="card">${quotation.payment_terms ? `<h2>เงื่อนไขการชำระเงิน</h2><p style="white-space:pre-wrap;margin-top:0">${escapeHtml(quotation.payment_terms)}</p>` : ''}${seller.bankAccount ? `<h2>ช่องทางการชำระเงิน</h2><p style="white-space:pre-wrap;margin-top:0">${escapeHtml(seller.bankAccount)}</p>` : ''}${quotation.notes ? `<h2>หมายเหตุ</h2><p style="white-space:pre-wrap;margin:0">${escapeHtml(quotation.notes)}</p>` : ''}</section>` : ''}`, channel);
 }
 
 function publicNotFoundPage() {
-  return publicShell('ไม่พบใบเสนอราคา · Donnar.Tech', '<section class="card"><h1>ไม่พบใบเสนอราคา</h1><p class="muted">ลิงก์อาจไม่ถูกต้องหรือหมดอายุแล้ว กรุณาเปิดลิงก์ล่าสุดที่ทีมส่งให้ในแชต LINE</p></section>');
+  return publicShell('ไม่พบใบเสนอราคา · Donnar.Tech', '<section class="card"><h1>ไม่พบใบเสนอราคา</h1><p class="muted">ลิงก์อาจไม่ถูกต้องหรือหมดอายุแล้ว กรุณาเปิดลิงก์ล่าสุดที่ทีมส่งให้</p></section>');
 }
 
 module.exports = { ADMIN_STYLE, quotationListPage, quotationEditorPage, quotationViewPage, conversationQuotationPanel, decisionPanel, publicQuotationPage, publicNotFoundPage, editorModel, formModel };

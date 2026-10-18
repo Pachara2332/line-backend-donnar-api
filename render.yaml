@@ -20,6 +20,16 @@ services:
         sync: false
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
+      - key: MESSENGER_APP_SECRET
+        sync: false
+      - key: MESSENGER_WEBHOOK_VERIFY_TOKEN
+        sync: false
+      - key: MESSENGER_PAGE_ACCESS_TOKEN
+        sync: false
+      - key: MESSENGER_PAGE_ID
+        sync: false
+      - key: MESSENGER_GRAPH_API_VERSION
+        sync: false
       - key: STAFF_PASSWORD_HASH
         sync: false
       - key: LIFF_ID

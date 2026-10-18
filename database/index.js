@@ -72,6 +72,7 @@ async function initializeDatabase(pool, config = {}) {
   await withTransaction(pool, async (client) => {
     await client.query("UPDATE messages SET send_status = 'UNKNOWN', last_error = 'process_interrupted' WHERE send_status = 'SENDING'");
     await client.query("UPDATE rich_menu_publications SET status = 'FAILED' WHERE status = 'CREATING'");
+    await client.query("UPDATE messenger_menu_publications SET status = 'FAILED', last_error = 'process_interrupted' WHERE status = 'CREATING'");
     await seedDefaultCopy(client);
     if (config.staffPasswordHash) {
       await client.query(`INSERT INTO staff_users(username, password_hash) VALUES ($1, $2)
