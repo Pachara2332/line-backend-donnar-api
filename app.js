@@ -183,7 +183,7 @@ function buildApp({ db, lineClient, messengerClient = null, config, verifyLiffTo
     const mode = req.query['hub.mode'];
     const verifyToken = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
-    if (!config.messengerEnabled || mode !== 'subscribe' || verifyToken !== config.messengerWebhookVerifyToken || typeof challenge !== 'string' || challenge.length > 1024) return res.sendStatus(403);
+    if (!config.messengerWebhookVerifyToken || mode !== 'subscribe' || verifyToken !== config.messengerWebhookVerifyToken || typeof challenge !== 'string' || challenge.length > 1024) return res.sendStatus(403);
     return res.type('text').send(challenge);
   });
   app.post('/webhooks/messenger', (req, res, next) => config.messengerEnabled ? next() : res.sendStatus(404), express.raw({ type: 'application/json', limit: '1mb' }), createMessengerSignatureMiddleware(config.messengerAppSecret), async (req, res, next) => {
