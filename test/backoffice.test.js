@@ -31,6 +31,21 @@ async function login(app) {
   return { cookie, page, csrf: page.text.match(/name="_csrf" value="([^"]+)"/)[1] };
 }
 
+test('renders an empty Facebook inbox when there are no conversations', async (t) => {
+  const { db, app, close } = await setup();
+  t.after(close);
+  const query = db.query.bind(db);
+  db.query = (sql, params) => /FROM leads l\s+JOIN conversations c/.test(sql) && sql.includes('WHERE c.channel = $4')
+    ? Promise.resolve({ rows: [] })
+    : query(sql, params);
+  const session = await request(app).post('/admin/login').type('form').send({ username: 'operator', password: 'correct horse battery staple' });
+  const cookie = session.headers['set-cookie'][0].split(';')[0];
+  const page = await request(app).get('/admin/inbox?channel=FACEBOOK').set('cookie', cookie);
+
+  assert.equal(page.status, 200);
+  assert.match(page.text, /ยังไม่มีบทสนทนา/);
+});
+
 test('requires a staff session and CSRF token for back-office changes', async (t) => {
   const { db, app, close } = await setup();
   t.after(close);
